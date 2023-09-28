@@ -1,4 +1,4 @@
-# Project Name
+# Clean Architecture Template
 
 This template is built using Clean Architecture principles and leverages the `josysy-commons` packages. It also includes Prizma for database interaction.
 
