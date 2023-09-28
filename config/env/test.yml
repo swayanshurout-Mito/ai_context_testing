@@ -1,0 +1,20 @@
+app:
+    name: Clean-Architecture-Template
+    host: localhost
+    port: 8080
+    node_env: test
+
+example:
+    base_url: https://api.coindesk.com/v1
+    content_type: application/json
+
+error:
+    sentry:
+        enable: true
+        log_level: error
+        traces_sample_rate: 1.0
+        debug_mode: false
+
+http:
+    timeout: 5000
+    max_redirects: 5

@@ -1,0 +1,57 @@
+generator client {
+    provider = "prisma-client-js"
+    output   = "../../../../../../node_modules/@prisma/mysql/client"
+}
+
+datasource db {
+    provider = "mysql"
+    url      = env("MYSQL_DB_URL")
+}
+
+model integrations {
+    id                         BigInt       @unique
+    api_host                   String       @db.VarChar(255)
+    authentication_type        Int
+    custom_field_keys          Json
+    encrypted_access_token     String       @db.VarChar(255)
+    encrypted_access_token_iv  String       @db.VarChar(255)
+    encrypted_client_secret    String       @db.VarChar(255)
+    encrypted_client_secret_iv String       @db.VarChar(255)
+    encrypted_refresh_token    String       @db.VarChar(255)
+    encrypted_refresh_token_iv String       @db.VarChar(255)
+    encrypted_webhook_token_iv String       @db.VarChar(255)
+    identifier                 String       @db.VarChar(255)
+    last_sync_at               String       @db.VarChar(255)
+    memo                       String       @db.VarChar(255)
+    message                    String       @db.VarChar(255)
+    status                     Int
+    sync_error                 Boolean
+    created_at                 DateTime     @default(now())
+    updated_at                 DateTime     @default(now())
+    client_id                  String       @db.VarChar(255)
+    organization_id            BigInt
+    software_id                Int
+    software_plan_id           BigInt
+    tenant_id                  String       @db.VarChar(255)
+    // organization               Organization @relation(fields: [organization_id], references: [id])
+
+    @@index([organization_id, software_plan_id])
+}
+
+model Organization {
+    id                    Int         @unique
+    display_name          String         @db.VarChar(255)
+    // domain_name           String         @db.VarChar(255)
+    // enabled_feature_flags Json
+    // encryption_key        String         @db.VarChar(255)
+    key                   String         
+    // legal_name            String         @db.VarChar(255)
+    // nonchargeable         Boolean        @default(false)
+    // created_at            DateTime       @default(now())
+    // updated_at            DateTime       @default(now())
+    // country_id            Int
+    // organization_group_id Int
+    // integrations          integrations[]
+
+    @@index([key])
+}

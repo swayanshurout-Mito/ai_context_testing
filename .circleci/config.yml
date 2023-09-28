@@ -1,0 +1,39 @@
+version: 2.1
+orbs:
+  node: circleci/node@5.0.2
+
+defaults: &defaults
+  working_directory: ~/Clean-Architecture-Template
+
+jobs:
+  lint-and-test:
+    <<: *defaults
+    executor:
+      name: node/default
+    steps:
+      - checkout
+      - restore_cache:
+          name: Restore NPM Package Cache
+          keys:
+            - npm-{{ arch }}-dependencies-{{ checksum "package-lock.json" }}
+      - run:
+          name: Install Dependencies
+          command: |
+            echo "//registry.npmjs.org/:_authToken=${NPM_AUTH_TOKEN}" > ~/.npmrc  # Set authentication for private registry
+            npm install
+      - save_cache:
+          name: Save NPM Package Cache
+          key: npm-{{ arch }}-dependencies-{{ checksum "package-lock.json" }}
+          paths:
+            - ~/.cache/npm
+      - run:
+          name: Run ESLint
+          command: npm run lint
+      - run:
+          name: Run Unit Tests
+          command: npm test --maxWorkers=2
+
+workflows:
+  lint-and-test:
+    jobs:
+      - lint-and-test

@@ -1,0 +1,42 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+generator client {
+  provider = "prisma-client-js"
+  output   = "../../../../../../node_modules/@prisma/mongo/client"
+}
+
+datasource db {
+  provider = "mongodb"
+  url      = env("MONGO_DB_URL")
+}
+
+model AppUsageData {
+  id                  String   @id @default(uuid()) @map("_id")
+  createdAt           DateTime @default(now())
+  updatedAt           DateTime @updatedAt
+  collectionRunId     String
+  organizationId      Int
+  identity            Json
+  software            String
+  externalSoftwareKey String
+  hostname            String
+  source              String
+  softwareLookupId    Int
+  ipAddress           String
+  usedAtTime          DateTime
+  timeSpentInSeconds  Int
+  device              Json
+  integrationId       Int
+
+  // organization        Organization @relation(fields: [organizationId], references: [id])
+
+  @@index([organizationId])
+}
+
+model Organization {
+  id        String   @id @default(uuid()) @map("_id")
+  name      String
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}

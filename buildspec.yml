@@ -1,0 +1,22 @@
+version: 0.2
+phases:
+  pre_build:
+    commands:
+      - docker login -u taksel -p $DOCKERHUB_LOGIN_PASSWORD
+      - aws ecr get-login-password --region $AWS_DEFAULT_REGION | docker login --username AWS --password-stdin $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com
+  build:
+    commands:
+      - docker pull $REPOSITORY_URI:${RUNTIME_CONFIG}_node || true
+      - docker pull $REPOSITORY_URI:${RUNTIME_CONFIG} || true
+      - docker build -t node --target node-docker --cache-from $REPOSITORY_URI:${RUNTIME_CONFIG}_node --build-arg RUNTIME_CONFIG=${RUNTIME_CONFIG} .
+      - docker build -t app --cache-from $REPOSITORY_URI:${RUNTIME_CONFIG}_node --cache-from $REPOSITORY_URI:${RUNTIME_CONFIG} --build-arg RUNTIME_CONFIG=${RUNTIME_CONFIG} .
+      - docker tag node $REPOSITORY_URI:${RUNTIME_CONFIG}_node
+      - docker tag app $REPOSITORY_URI:${RUNTIME_CONFIG}
+  post_build:
+    commands:
+      - docker push $REPOSITORY_URI:${RUNTIME_CONFIG}_node
+      - docker push $REPOSITORY_URI:${RUNTIME_CONFIG}
+      - printf '[{"name":"app","imageUri":"%s"}]' $REPOSITORY_URI:$RUNTIME_CONFIG > imagedefinitions.json
+artifacts:
+    files:
+      - imagedefinitions.json
