@@ -3,7 +3,7 @@
 This template is built using Clean Architecture principles and leverages the `josysy-commons` packages. It also includes Prizma for database interaction.
 
 ## Project Structure
-
+```
 Project Template/
 ├─ .circleci/                 # CircleCI Configuration
 │   └─ config.yml             # CircleCI Configuration File
@@ -32,7 +32,7 @@ Project Template/
 ├─ package.json               # Node.js Package File
 ├─ tsconfig.json              # TypeScript Configuration File
 └─ README.md                  # Project Documentation
-
+```
 
 
 The project is organized into different folders, each serving a specific purpose:
