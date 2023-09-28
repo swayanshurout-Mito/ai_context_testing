@@ -4,14 +4,6 @@ This template is built using Clean Architecture principles and leverages the `jo
 
 ## Project Structure
 
-.
-├── ...
-├── test                    # Test files (alternatively `spec` or `tests`)
-│   ├── benchmarks          # Load and stress tests
-│   ├── integration         # End-to-end, integration tests (alternatively `e2e`)
-│   └── unit                # Unit tests
-└── ...
-
 Project Template/
 ├─ .circleci/                 # CircleCI Configuration
 │   └─ config.yml             # CircleCI Configuration File
