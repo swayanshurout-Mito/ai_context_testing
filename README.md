@@ -5,34 +5,34 @@ This template is built using Clean Architecture principles and leverages the `jo
 ## Project Structure
 
 Project Template/
-Project Root/
-├─ .circleci/                    # CircleCI Configuration
-│   └─ config.yml                # CircleCI Configuration File
-├─ config/                       # Environment Configuration Files
-│   ├─ production.yml            # Production Environment Configuration
-│   ├─ staging.yml               # Staging Environment Configuration
-│   └─ ...                       # Other Environment Configuration Files
-├─ src/                          # Source Code
-│   ├─ core/                     # Core Layer
-│   │   ├─ dtos/                 # Data Transfer Objects
-│   │   └─ entity/               # Business Entities and Rules
-│   ├─ applications/             # Application Layer
-│   │   └─ ...                   # Use Cases and Orchestrators
-│   ├─ adapters/                 # Adapters Layer
-│   │   ├─ controllers/          # Controllers for REST Endpoints
-│   │   ├─ persistence/          # Persistence Layer
-│   │   │   ├─ prisma/           # Prisma ORM
-│   │   │   │   ├─ dao/          # Data Access Objects for Prisma
-│   │   │   │   ├─ models/       # Models and Schemas
-│   │   │   │   │   ├─ mysql/    # MySQL Models and Schemas
-│   │   │   │   │   └─ mongo/    # MongoDB Models and Schemas
-│   │   │   ├─ services/         # Services for Prisma
-│   │   │   └─ repositories/     # Repositories (Gateway to ORM/ODM)
-│   │   └─ web/                  # External API Gateway
-├─ node_modules/
-├─ package.json
-├─ tsconfig.json
-└─ README.md
+├─ .circleci/                 # CircleCI Configuration
+│   └─ config.yml             # CircleCI Configuration File
+├─ config/                    # Environment Configuration Files
+│   ├─ production.yml         # Production Environment Configuration
+│   ├─ staging.yml            # Staging Environment Configuration
+│   └─ ...                    # Other Environment Configuration Files
+├─ src/                       # Source Code
+│   ├─ core/                  # Core Layer
+│   │   ├─ dtos/              # Data Transfer Objects
+│   │   └─ entity/            # Business Entities and Rules
+│   ├─ applications/          # Application Layer
+│   │   └─ ...                # Use Cases and Orchestrators
+│   ├─ adapters/              # Adapters Layer
+│   │   ├─ controllers/       # Controllers for REST Endpoints
+│   │   ├─ persistence/       # Persistence Layer
+│   │   │   ├─ prisma/        # Prisma ORM
+│   │   │   │   ├─ dao/       # Data Access Objects for Prisma
+│   │   │   │   ├─ models/    # Models and Schemas
+│   │   │   │   │   ├─ mysql/ # MySQL Models and Schemas
+│   │   │   │   │   └─ mongo/ # MongoDB Models and Schemas
+│   │   │   ├─ services/      # Services for Prisma
+│   │   │   └─ repositories/  # Repositories (Gateway to ORM/ODM)
+│   │   └─ web/               # External API Gateway
+├─ node_modules/              # Node.js Modules
+├─ package.json               # Node.js Package File
+├─ tsconfig.json              # TypeScript Configuration File
+└─ README.md                  # Project Documentation
+
 
 
 The project is organized into different folders, each serving a specific purpose:
