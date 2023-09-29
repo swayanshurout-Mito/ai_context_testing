@@ -14,6 +14,7 @@ Project Template/
 ├─ src/                       # Source Code
 │   ├─ core/                  # Core Layer
 │   │   ├─ dtos/              # Data Transfer Objects
+│   │   ├─ interfaces/        # Interfaces
 │   │   └─ entity/            # Business Entities and Rules
 │   ├─ applications/          # Application Layer
 │   │   └─ ...                # Use Cases and Orchestrators
