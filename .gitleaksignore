@@ -1,0 +1,12 @@
+
+//Type of secret 
+//For Aws Access Keys and Secret Keys - aws-access-token 
+// For Api keys - generic-api-key
+//Slack - slack-user-token
+//Github - github-pat, github-app-token, github-oauth
+//NPM - npm-access-token
+
+//ignores that particular hardcoded key
+
+//{path}:{type_of_secret}:{line_number}
+//src/sample.env:aws-access-token:10  

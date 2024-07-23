@@ -1,0 +1,43 @@
+name: gitleaks
+on:
+  pull_request:
+  push:
+  workflow_dispatch:
+
+jobs:
+  scan:
+    name: gitleaks
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+        with:
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@v3
+        with:
+          go-version: '1.17'  # Ensure we use Go 1.17 or later
+
+      - name: Install Gitleaks
+        run: go install github.com/zricethezav/gitleaks/v8@latest
+
+      - name: Run Gitleaks
+        id: gitleaks
+        continue-on-error: true  # Continue the job even if leaks are detected
+        run: |
+          gitleaks detect --source=. --no-git --redact -v --exit-code=2 --report-format=csv --report-path=results.csv --log-level=debug
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITLEAKS_LICENSE: ${{ secrets.GITLEAKS_LICENSE}} # Only required for Organizations, not personal accounts.
+      - name: Upload Gitleaks report
+        if: always()
+        uses: actions/upload-artifact@v3
+        with:
+          name: gitleaks-report
+          path: results.csv
+      - name: Check for Gitleaks exit code
+        if: steps.gitleaks.outcome == 'failure'
+        run: |
+          echo "Gitleaks detected leaks. Failing the build."
+          exit 1
