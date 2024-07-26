@@ -1,0 +1,27 @@
+{
+  // $schema provides code completion hints to IDEs.
+  "$schema": "https://github.com/IBM/audit-ci/raw/main/docs/schema.json",
+  "critical": true,
+  "allowlist": [
+    // admin-lte, admin-lte vulnerabilty
+   // "CVE-2021-36471"
+   //==========================
+   // js-yaml  <=3.13.0
+  // Severity: critical
+  // Denial of Service in js-yaml - https://github.com/advisories/GHSA-2pr6-76vf-7546
+  // Deserialization Code Execution in js-yaml - https://github.com/advisories/GHSA-xxvw-45rp-3mj2
+  // Code Injection in js-yaml - https://github.com/advisories/GHSA-8j8c-7jfh-h6hx
+  //============================
+  "GHSA-xxvw-45rp-3mj2|jxLoader>js-yaml",
+  "GHSA-67hx-6x53-jw92",
+    
+    //============================
+    //     uglify-js  <=2.5.0
+    // Severity: critical
+    // Regular Expression Denial of Service in uglify-js - https://github.com/advisories/GHSA-c9f4-xj24-8jqx
+    // Incorrect Handling of Non-Boolean Comparisons During Minification in uglify-js - https://github.com/advisories/GHSA-34r7-q49f-h37c
+    //============================
+    "GHSA-34r7-q49f-h37c|uglify-js"
+
+  ]
+}

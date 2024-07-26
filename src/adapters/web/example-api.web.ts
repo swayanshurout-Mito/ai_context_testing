@@ -1,8 +1,8 @@
 import { Injectable } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { AxiosResponse } from 'axios';
-import { HttpHandlerService } from '@raksul/josys-commons/packages/http';
-import { LoggerService } from '@raksul/josys-commons/packages/logger';
+import { HttpHandlerService } from '@josys-src/josys-commons/packages/http';
+import { LoggerService } from '@josys-src/josys-commons/packages/logger';
 
 @Injectable()
 export class ExampleExternalApiService {

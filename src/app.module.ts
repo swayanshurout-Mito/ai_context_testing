@@ -4,8 +4,8 @@ import { APP_INTERCEPTOR } from '@nestjs/core';
 
 import { configuration as configVariable, configuration } from '../config/configuration';
 import { PerformanceMonitor } from './common/interceptors/performance/performance.interceptor';
-import { HttpHandlerModule } from '@raksul/josys-commons/packages/http';
-import { LoggerModule } from '@raksul/josys-commons/packages/logger';
+import { HttpHandlerModule } from '@josys-src/josys-commons/packages/http';
+import { LoggerModule } from '@josys-src/josys-commons/packages/logger';
 import { ExampleUseCaseModule } from './applications/examples/example.module';
 
 const dynamicConfig = configVariable()

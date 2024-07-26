@@ -19,7 +19,8 @@ jobs:
       - run:
           name: Install Dependencies
           command: |
-            echo "//registry.npmjs.org/:_authToken=${NPM_AUTH_TOKEN}" > ~/.npmrc  # Set authentication for private registry
+            echo "test ${NPM_AUTH_TOKEN}"
+            echo "//npm.pkg.github.com/:_authToken=${NPM_AUTH_TOKEN}" >> ~/.npmrc  # Set authentication for private registry
             npm install
       - save_cache:
           name: Save NPM Package Cache
@@ -29,6 +30,9 @@ jobs:
       - run:
           name: Run ESLint
           command: npm run lint
+      - run:
+          name: run-audit-ci
+          command: npx audit-ci@^6  --config ./audit-ci.jsonc          
       - run:
           name: Run Unit Tests
           command: npm test --maxWorkers=2

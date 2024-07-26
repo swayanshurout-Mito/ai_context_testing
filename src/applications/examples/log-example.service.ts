@@ -1,5 +1,5 @@
 import { Injectable } from '@nestjs/common';
-import { LoggerService } from '@raksul/josys-commons/packages/logger';
+import { LoggerService } from '@josys-src/josys-commons/packages/logger';
 
 @Injectable()
 export class LogExampleService {

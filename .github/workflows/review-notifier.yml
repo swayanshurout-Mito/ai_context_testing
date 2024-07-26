@@ -1,0 +1,68 @@
+name: Code Review Automation
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+jobs:
+  notify-reviewers:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v2
+
+      - name: Get CODEOWNERS content
+        id: codeowners
+        run: |
+          CODEOWNERS=$(curl -s -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" https://api.github.com/repos/${{ github.repository }}/contents/.github/CODEOWNERS | jq -r '.content' | base64 --decode)
+          echo "CODEOWNERS: $CODEOWNERS"
+          echo "::set-output name=codeowners::$CODEOWNERS"
+
+      - name: Get changed files
+        id: changed_files
+        run: |
+          CHANGED_FILES=$(curl -s -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" https://api.github.com/repos/${{ github.repository }}/pulls/${{ github.event.pull_request.number }}/files | jq -r '.[].filename')
+          echo "CHANGED_FILES: $CHANGED_FILES"
+          echo "::set-output name=changed_files::$(echo "$CHANGED_FILES" | tr '\n' ' ')"
+
+      - name: Extract reviewers from CODEOWNERS
+        id: extract_reviewers
+        run: |
+          CODEOWNERS="${{ steps.codeowners.outputs.codeowners }}"
+          CHANGED_FILES="${{ steps.changed_files.outputs.changed_files }}"
+          echo "Codeowners content: $CODEOWNERS"
+          echo "Changed files: $CHANGED_FILES"
+          
+          REVIEWERS=$(echo "$CODEOWNERS" | grep -E "^(/|\\*|\\.).*" | while read -r line; do
+            IFS=' ' read -r -a array <<< "$line"
+            PATTERN=${array[0]}
+            for file in $CHANGED_FILES; do
+              MATCH=$(echo "$file" | grep -E "$PATTERN")
+              if [ ! -z "$MATCH" ]; then
+                echo "${array[@]:1}"
+              fi
+            done
+          done | tr ' ' '\n' | sort | uniq | tr '\n' ' ')
+          echo "Extracted reviewers: $REVIEWERS"
+          echo "::set-output name=reviewers::$(echo "$REVIEWERS" | tr '\n' ' ')"
+
+      - name: Notify code owners
+        run: |
+          REVIEWERS="${{ steps.extract_reviewers.outputs.reviewers }}"
+          if [ -z "$REVIEWERS" ]; then
+            echo "No code owners found for the changed files."
+            exit 0
+          fi
+
+          echo "Notifying code owners: $REVIEWERS"
+
+          # Prepare the message
+          MESSAGE=":bell: *Code Review Request*\n"
+          MESSAGE+="*Repository:* ${{ github.repository }}\n"
+          MESSAGE+="*PR:* #${{ github.event.pull_request.number }} - ${{ github.event.pull_request.title }}\n"
+          MESSAGE+="*URL:* ${{ github.event.pull_request.html_url }}\n"
+          MESSAGE+="*Reviewers:* $REVIEWERS"
+
+          # Send the message to Slack
+          curl -X POST -H 'Content-type: application/json' --data "{\"text\":\"$MESSAGE\"}" ${{ secrets.SLACK_WEBHOOK_CO_URL }}
