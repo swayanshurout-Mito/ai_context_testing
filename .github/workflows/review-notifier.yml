@@ -15,7 +15,7 @@ jobs:
       - name: Get CODEOWNERS content
         id: codeowners
         run: |
-          CODEOWNERS=$(curl -s -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" https://api.github.com/repos/${{ github.repository }}/contents/.github/CODEOWNERS | jq -r '.content' | base64 --decode)
+          CODEOWNERS=$(curl -s -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" https://api.github.com/repos/${{ github.repository }}/contents/.github/workflows/CODEOWNERS | jq -r '.content' | base64 --decode --ignore-garbage)
           echo "CODEOWNERS: $CODEOWNERS"
           echo "::set-output name=codeowners::$CODEOWNERS"
 
