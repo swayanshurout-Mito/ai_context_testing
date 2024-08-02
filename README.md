@@ -148,4 +148,3 @@ $ npm run test:cov
 
 - Author -  [Avinash](https://github.com/avinash-iitb)
 
-
