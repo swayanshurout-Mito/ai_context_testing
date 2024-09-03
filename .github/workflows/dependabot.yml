@@ -1,0 +1,33 @@
+name: Check Dependabot Alerts
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+jobs:
+  check-dependabot-alerts:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Check for Critical and High Vulnerabilities
+        run: |
+          echo "Checking for critical and high Dependabot alerts..."
+          CRITICAL_ALERTS=$(curl -s -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+                            -H "Accept: application/vnd.github+json" \
+                            https://api.github.com/repos/${{ github.repository }}/dependabot/alerts \
+                            | jq '[.[] | select(.severity == "critical")] | length')
+
+          HIGH_ALERTS=$(curl -s -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+                        -H "Accept: application/vnd.github+json" \
+                        https://api.github.com/repos/${{ github.repository }}/dependabot/alerts \
+                        | jq '[.[] | select(.severity == "high")] | length')
+
+          if [ "$CRITICAL_ALERTS" -gt 0 ] || [ "$HIGH_ALERTS" -gt 0 ]; then
+            echo "Failing build due to $CRITICAL_ALERTS critical and $HIGH_ALERTS high severity alerts."
+            exit 1
+          else
+            echo "No critical or high severity Dependabot alerts found."
+          fi
