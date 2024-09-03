@@ -20,6 +20,7 @@ jobs:
                          https://api.github.com/repos/${{ github.repository }}/dependabot/alerts)
                          
           echo "API Response:"
+          echo "${{ secrets.GITHUB_TOKEN }}"
           echo "$ALERTS"
           
           CRITICAL_ALERTS=$(echo "$ALERTS" | jq '[.[] | select(.severity == "critical")] | length')
