@@ -20,12 +20,11 @@ jobs:
                          https://api.github.com/repos/${{ github.repository }}/dependabot/alerts)
                          
           echo "API Response:"
-          echo "${{ secrets.GITHUB_TOKEN }}"
           echo "$ALERTS"
           
-          CRITICAL_ALERTS=$(echo "$ALERTS" | jq '[.[] | select(.severity == "critical")] | length')
-          HIGH_ALERTS=$(echo "$ALERTS" | jq '[.[] | select(.severity == "high")] | length')
-      
+          CRITICAL_ALERTS=$(echo "$ALERTS" | jq '[.[] | select(.security_advisory.severity == "critical")] | length')
+          HIGH_ALERTS=$(echo "$ALERTS" | jq '[.[] | select(.security_advisory.severity == "high")] | length')
+
           if [ "$CRITICAL_ALERTS" -gt 0 ] || [ "$HIGH_ALERTS" -gt 0 ]; then
             echo "Failing build due to $CRITICAL_ALERTS critical and $HIGH_ALERTS high severity alerts."
             exit 1
