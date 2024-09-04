@@ -22,12 +22,33 @@ jobs:
           echo "API Response:"
           echo "$ALERTS"
           
+          echo "Generating CSV report..."
+          echo "number,state,package,ecosystem,manifest_path,severity,summary,created_at,url" > dependabot_report.csv
+          echo "$ALERTS" | jq -r '.[] | [
+              .number,
+              .state,
+              .dependency.package.name,
+              .dependency.package.ecosystem,
+              .dependency.manifest_path,
+              .security_advisory.severity,
+              .security_advisory.summary,
+              .created_at,
+              .html_url
+            ] | @csv' >> dependabot_report.csv
+
           CRITICAL_ALERTS=$(echo "$ALERTS" | jq '[.[] | select(.security_advisory.severity == "critical")] | length')
           HIGH_ALERTS=$(echo "$ALERTS" | jq '[.[] | select(.security_advisory.severity == "high")] | length')
 
           if [ "$CRITICAL_ALERTS" -gt 0 ] || [ "$HIGH_ALERTS" -gt 0 ]; then
+            echo "Critical or high severity alerts detected."
             echo "Failing build due to $CRITICAL_ALERTS critical and $HIGH_ALERTS high severity alerts."
             exit 1
           else
             echo "No critical or high severity Dependabot alerts found."
-          fi
+          
+      - name: Upload CSV Report
+        if: always()
+        uses: actions/upload-artifact@v3
+        with:
+          name: dependabot-report
+          path: dependabot_report.csv
