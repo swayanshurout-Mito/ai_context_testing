@@ -1,11 +1,11 @@
-name: Check Dependabot Alerts
+name: Dependabot Scan
 
 on:
   pull_request:
     types: [opened, synchronize, reopened]
 
 jobs:
-  check-dependabot-alerts:
+  dependabot-scan:
     runs-on: ubuntu-latest
 
     steps:
