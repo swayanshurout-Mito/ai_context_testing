@@ -45,6 +45,7 @@ jobs:
             exit 1
           else
             echo "No critical or high severity Dependabot alerts found."
+          fi
           
       - name: Upload CSV Report
         if: always()
