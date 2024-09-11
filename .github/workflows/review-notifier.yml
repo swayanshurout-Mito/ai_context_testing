@@ -6,63 +6,102 @@ on:
 
 jobs:
   notify-reviewers:
+    # Skip notification if PR is a draft
+    if: github.event.pull_request.draft == false  
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout code
+      - name: Checkout Code
         uses: actions/checkout@v2
 
-      - name: Get CODEOWNERS content
-        id: codeowners
+      - name: Fetch User Mapping from GitHub-Teams repository
         run: |
-          CODEOWNERS=$(curl -s -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" https://api.github.com/repos/${{ github.repository }}/contents/.github/CODEOWNERS | jq -r '.content' | base64 --decode --ignore-garbage)
-          echo "CODEOWNERS: $CODEOWNERS"
-          echo "::set-output name=codeowners::$CODEOWNERS"
+          USER_MAPPING=$(curl -s -H "Authorization: token ${{ secrets.JOSYS_TOKEN }}" https://api.github.com/repos/josys-src/GitHub-Teams/contents/.github/user.json | jq -r '.content' | base64 --decode )
+          echo "$USER_MAPPING" > user_mapping.json
 
-      - name: Get changed files
-        id: changed_files
+      - name: Install shyaml
         run: |
-          CHANGED_FILES=$(curl -s -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" https://api.github.com/repos/${{ github.repository }}/pulls/${{ github.event.pull_request.number }}/files | jq -r '.[].filename')
-          echo "CHANGED_FILES: $CHANGED_FILES"
-          echo "::set-output name=changed_files::$(echo "$CHANGED_FILES" | tr '\n' ' ')"
+          sudo apt-get update
+          sudo apt-get install -y python3-pip
+          pip3 install shyaml
 
-      - name: Extract reviewers from CODEOWNERS
+      - name: Extract Requested Reviewers
         id: extract_reviewers
         run: |
-          CODEOWNERS="${{ steps.codeowners.outputs.codeowners }}"
-          CHANGED_FILES="${{ steps.changed_files.outputs.changed_files }}"
-          echo "Codeowners content: $CODEOWNERS"
-          echo "Changed files: $CHANGED_FILES"
-          
-          REVIEWERS=$(echo "$CODEOWNERS" | grep -E "^(/|\\*|\\.).*" | while read -r line; do
-            IFS=' ' read -r -a array <<< "$line"
-            PATTERN=${array[0]}
-            for file in $CHANGED_FILES; do
-              MATCH=$(echo "$file" | grep -E "$PATTERN")
-              if [ ! -z "$MATCH" ]; then
-                echo "${array[@]:1}"
-              fi
-            done
-          done | tr ' ' '\n' | sort | uniq | tr '\n' ' ')
-          echo "Extracted reviewers: $REVIEWERS"
-          echo "::set-output name=reviewers::$(echo "$REVIEWERS" | tr '\n' ' ')"
+          reviewers=$(jq -r '.pull_request.requested_reviewers | .[] | .login' "$GITHUB_EVENT_PATH" | tr '\n' ' ')
+          echo "reviewers=${reviewers}" >> $GITHUB_ENV
 
-      - name: Notify code owners
+      - name: Extract Emails for Reviewers
+        id: user_mapping
         run: |
-          REVIEWERS="${{ steps.extract_reviewers.outputs.reviewers }}"
-          if [ -z "$REVIEWERS" ]; then
-            echo "No code owners found for the changed files."
-            exit 0
+          email_ids=""
+          IFS=' ' read -r -a owners <<< "${{ env.reviewers }}"
+          for owner in "${owners[@]}"; do
+            email_id=$(jq -r --arg owner "$owner" '.[$owner]' user_mapping.json)
+            echo "Email ID for $owner: $email_id"
+            if [ -n "$email_id" ]; then
+              email_ids="$email_ids $email_id"
+            fi
+          done
+          echo "email_ids=$email_ids" >> $GITHUB_ENV
+
+      - name: Retrieve Slack IDs from Emails
+        id: slack_ids
+        run: |
+          slack_ids=""
+          IFS=' ' read -r -a emails <<< "${{ env.email_ids }}"
+
+          for email in "${emails[@]}"; do
+            slack_id=$(curl --request GET \
+            --url "${{secrets.SLACK_EMAIL_LOOKUP_API}}?email=$email" \
+            --header "Authorization: Bearer ${{ secrets.SLACK_API_CO_TOKEN }}" \
+            --header 'Content-Type: application/x-www-form-urlencoded' | jq -r '.user.id')
+            if [ -n "$slack_id" ] && [ "$slack_id" != "null" ]; then
+              slack_ids="$slack_ids <@$slack_id>"
+            fi
+          done
+          echo "slack_ids=$slack_ids" >> $GITHUB_ENV
+      - name: Extract PR Author
+        id: pr_author
+        run: |
+          author_login=$(jq -r '.pull_request.user.login' "$GITHUB_EVENT_PATH")
+          echo "author_login=${author_login}" >> $GITHUB_ENV
+
+      - name: Get Slack ID of PR Author
+        id: author_slack_id
+        run: |
+          author_email=$(jq -r --arg author "${{ env.author_login }}" '.[$author]' user_mapping.json)
+          author_slack_id=$(curl --request GET \
+            --url "${{secrets.SLACK_EMAIL_LOOKUP_API}}?email=$author_email" \
+            --header "Authorization: Bearer ${{ secrets.SLACK_API_CO_TOKEN }}" \
+            --header 'Content-Type: application/x-www-form-urlencoded' | jq -r '.user.id')
+          if [ -n "$author_slack_id" ] && [ "$author_slack_id" != "null" ]; then
+            author_slack_id="<@$author_slack_id>"
+          else
+            author_slack_id="${{ env.author_login }}"
           fi
+          echo "author_slack_id=${author_slack_id}" >> $GITHUB_ENV
 
-          echo "Notifying code owners: $REVIEWERS"
+      - name: Notify Code Owners
+        run: |
+          EVENT_TYPE="${{ github.event.action }}"
 
-          # Prepare the message
           MESSAGE=":bell: *Code Review Request*\n"
           MESSAGE+="*Repository:* ${{ github.repository }}\n"
+          MESSAGE+="*Branch:* ${{ github.event.pull_request.base.ref }} <-- ${{ github.event.pull_request.head.ref }}\n"
           MESSAGE+="*PR:* #${{ github.event.pull_request.number }} - ${{ github.event.pull_request.title }}\n"
           MESSAGE+="*URL:* ${{ github.event.pull_request.html_url }}\n"
-          MESSAGE+="*Reviewers:* $REVIEWERS"
+          MESSAGE+="*Event Type:*  $EVENT_TYPE \n"
+          MESSAGE+="*Author:* ${{ env.author_slack_id }}\n"
+          MESSAGE+="*Reviewers:* ${{ env.slack_ids }}"
+
+          if [[ "${{ github.event.pull_request.base.ref }}" == "main" ]] || [[ "${{ github.event.pull_request.base.ref }}" == "staging" ]]; then
+            WEBHOOK_URL="${{ secrets.SLACK_WEBHOOK_CO_URL }}"
+          elif [[ "${{ github.event.pull_request.base.ref }}" == "release"* ]]; then
+            WEBHOOK_URL="${{ secrets.SLACK_WEBHOOK_CO_RB_API }}"
+          else
+            WEBHOOK_URL="${{ secrets.SLACK_WEBHOOK_CO_QB_URL }}"
+          fi
 
           # Send the message to Slack
-          curl -X POST -H 'Content-type: application/json' --data "{\"text\":\"$MESSAGE\"}" ${{ secrets.SLACK_WEBHOOK_CO_URL }}
+          curl -X POST -H 'Content-type: application/json' --data "{\"text\":\"$MESSAGE\"}" $WEBHOOK_URL
