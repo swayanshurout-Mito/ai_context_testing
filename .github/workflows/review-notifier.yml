@@ -19,21 +19,23 @@ jobs:
           USER_MAPPING=$(curl -s -H "Authorization: token ${{ secrets.JOSYS_TOKEN }}" https://api.github.com/repos/josys-src/GitHub-Teams/contents/.github/user.json | jq -r '.content' | base64 --decode )
           echo "$USER_MAPPING" > user_mapping.json
 
-      - name: Install shyaml
+      - name: Set up Python environment
         run: |
-          sudo apt-get update
-          sudo apt-get install -y python3-pip
-          pip3 install shyaml
+          python3 -m venv venv
+          source venv/bin/activate
+          pip install shyaml jq
 
       - name: Extract Requested Reviewers
         id: extract_reviewers
         run: |
+          source venv/bin/activate
           reviewers=$(jq -r '.pull_request.requested_reviewers | .[] | .login' "$GITHUB_EVENT_PATH" | tr '\n' ' ')
           echo "reviewers=${reviewers}" >> $GITHUB_ENV
 
       - name: Extract Emails for Reviewers
         id: user_mapping
         run: |
+          source venv/bin/activate
           email_ids=""
           IFS=' ' read -r -a owners <<< "${{ env.reviewers }}"
           for owner in "${owners[@]}"; do
@@ -48,6 +50,7 @@ jobs:
       - name: Retrieve Slack IDs from Emails
         id: slack_ids
         run: |
+          source venv/bin/activate
           slack_ids=""
           IFS=' ' read -r -a emails <<< "${{ env.email_ids }}"
 
@@ -61,15 +64,18 @@ jobs:
             fi
           done
           echo "slack_ids=$slack_ids" >> $GITHUB_ENV
+
       - name: Extract PR Author
         id: pr_author
         run: |
+          source venv/bin/activate
           author_login=$(jq -r '.pull_request.user.login' "$GITHUB_EVENT_PATH")
           echo "author_login=${author_login}" >> $GITHUB_ENV
 
       - name: Get Slack ID of PR Author
         id: author_slack_id
         run: |
+          source venv/bin/activate
           author_email=$(jq -r --arg author "${{ env.author_login }}" '.[$author]' user_mapping.json)
           author_slack_id=$(curl --request GET \
             --url "${{secrets.SLACK_EMAIL_LOOKUP_API}}?email=$author_email" \
@@ -84,6 +90,7 @@ jobs:
 
       - name: Notify Code Owners
         run: |
+          source venv/bin/activate
           EVENT_TYPE="${{ github.event.action }}"
 
           MESSAGE=":bell: *Code Review Request*\n"
@@ -95,7 +102,7 @@ jobs:
           MESSAGE+="*Author:* ${{ env.author_slack_id }}\n"
           MESSAGE+="*Reviewers:* ${{ env.slack_ids }}"
 
-          if [[ "${{ github.event.pull_request.base.ref }}" == "main" ]] || [[ "${{ github.event.pull_request.base.ref }}" == "staging" ]]; then
+          if [[ "${{ github.event.pull_request.base.ref }}" == "main" ]] || [[ "${{ github.event.pull_request.base.ref }}" == "staging" ]] || [[ "${{ github.event.pull_request.base.ref }}" == "production" ]]; then
             WEBHOOK_URL="${{ secrets.SLACK_WEBHOOK_CO_URL }}"
           elif [[ "${{ github.event.pull_request.base.ref }}" == "release"* ]]; then
             WEBHOOK_URL="${{ secrets.SLACK_WEBHOOK_CO_RB_API }}"
