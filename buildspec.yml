@@ -6,6 +6,7 @@ phases:
       - aws ecr get-login-password --region $AWS_DEFAULT_REGION | docker login --username AWS --password-stdin $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com
   build:
     commands:
+      - aws s3 cp s3://${S3_COMPLIANCE_BUCKET}/Josys_OSS_Notice.pdf ./Josys_OSS_Notice.pdf
       - docker pull $REPOSITORY_URI:${RUNTIME_CONFIG}_node || true
       - docker pull $REPOSITORY_URI:${RUNTIME_CONFIG} || true
       - docker build -t node --target node-docker --cache-from $REPOSITORY_URI:${RUNTIME_CONFIG}_node --build-arg RUNTIME_CONFIG=${RUNTIME_CONFIG} .

@@ -12,5 +12,7 @@ RUN npm install
 #Bundle application code
 COPY . .
 
+COPY ./Josys_OSS_Notice.pdf ./Josys_OSS_Notice.pdf
+
 #Run Application
 CMD [ "npm", "run", "start:dev"]
