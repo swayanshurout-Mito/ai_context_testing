@@ -1,0 +1,782 @@
+name: Prod-Deployment-Workflow
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  id-token: write
+  contents: read
+  pull-requests: write
+  issues: write
+  discussions: write
+
+env:
+  WORKFLOW_NAME: prod-deploy-{service-abbreviation}-${{ github.workflow_sha }}
+
+jobs:
+  create-ec2-runner:
+    name: "Start EC2 and Register Runner"
+    runs-on: ubuntu-latest
+    outputs:
+      instance_id: ${{ steps.launch-ec2.outputs.instance_id }}
+      public_ip: ${{ steps.launch-ec2.outputs.public_ip }}
+      workflow_name: ${{ env.WORKFLOW_NAME }}
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v1
+        with:
+          role-to-assume: ${{ secrets.JOSYS_AWS_BUILD_ROLE }}
+          aws-region: ${{ secrets.AWS_DEFAULT_REGION }}
+          role-session-name: GitHub-OIDC-TERRAFORM
+
+      - name: Create working directory
+        run: mkdir -p ~/runner_setup
+
+      - name: Check EC2 Instance and ECR Image
+        id: launch-ec2
+        run: |
+          # Check for existing EC2 instance
+          INSTANCE_JSON=$(aws ec2 describe-instances \
+            --filters "Name=tag:Name,Values=${{ env.WORKFLOW_NAME }}" "Name=instance-state-name,Values=running,stopped" \
+            --query 'Reservations[*].Instances[*].{InstanceId:InstanceId,State:State.Name,PublicIp:PublicIpAddress}' \
+            --output json)
+          INSTANCE_COUNT=$(echo $INSTANCE_JSON | jq 'length')
+          echo "Found $INSTANCE_COUNT instances with name ${{ env.WORKFLOW_NAME }}"
+          if [ "$INSTANCE_COUNT" -gt "0" ]; then
+            INSTANCE_ID=$(echo $INSTANCE_JSON | jq -r '.[0][0].InstanceId')
+            PUBLIC_IP=$(echo $INSTANCE_JSON | jq -r '.[0][0].PublicIp')
+            INSTANCE_STATE=$(echo $INSTANCE_JSON | jq -r '.[0][0].State')
+            echo "Instance ID: $INSTANCE_ID"
+            echo "Public IP: $PUBLIC_IP"
+            echo "Instance State: $INSTANCE_STATE"
+            if [ "$INSTANCE_STATE" == "stopped" ]; then
+              echo "Starting stopped instance: $INSTANCE_ID"
+              aws ec2 start-instances --instance-ids $INSTANCE_ID
+              aws ec2 wait instance-running --instance-ids $INSTANCE_ID
+              PUBLIC_IP=$(aws ec2 describe-instances --instance-ids $INSTANCE_ID \
+                --query 'Reservations[0].Instances[0].PublicIpAddress' --output text)
+            fi
+            echo "instance_id=$INSTANCE_ID" >> $GITHUB_OUTPUT
+            echo "public_ip=$PUBLIC_IP" >> $GITHUB_OUTPUT
+          else
+            echo "No existing instance found, creating a new one."
+            KEY_NAME=$(echo "${{ secrets.SELF_HOSTED_RUNNER_EC2_KEY_NAME }}" | sed 's/\.pem$//')
+            INSTANCE_ID=$(aws ec2 run-instances \
+              --image-id ${{ secrets.SELF_HOSTED_RUNNER_EC2_AMI_ID }} \
+              --instance-type t3a.medium \
+              --key-name "$KEY_NAME" \
+              --security-group-ids ${{ secrets.SELF_HOSTED_RUNNER_EC2_SECURITY_GROUP_ID }} \
+              --subnet-id ${{ secrets.SELF_HOSTED_RUNNER_EC2_SUBNET_ID }} \
+              --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=${{ env.WORKFLOW_NAME }}}]" \
+              --query 'Instances[0].InstanceId' \
+              --output text)
+            aws ec2 wait instance-running --instance-ids $INSTANCE_ID
+            sleep 60
+            PUBLIC_IP=$(aws ec2 describe-instances \
+              --instance-ids $INSTANCE_ID \
+              --query 'Reservations[0].Instances[0].PublicIpAddress' --output text)
+            echo "instance_id=$INSTANCE_ID" >> $GITHUB_OUTPUT
+            echo "public_ip=$PUBLIC_IP" >> $GITHUB_OUTPUT
+            echo "New instance created: $INSTANCE_ID"
+            echo "Public IP: $PUBLIC_IP"
+            # Proceed to register the instance as a self-hosted runner
+            echo "${{ secrets.SELF_HOSTED_RUNNER_SSH_KEY }}" > ~/runner_setup/${{ secrets.SELF_HOSTED_RUNNER_EC2_KEY_NAME }}
+            chmod 600 ~/runner_setup/${{ secrets.SELF_HOSTED_RUNNER_EC2_KEY_NAME }}
+            mkdir -p ~/.ssh
+            echo "StrictHostKeyChecking no" > ~/.ssh/config
+            # Fix the heredoc syntax for SSH
+            ssh -i ~/runner_setup/${{ secrets.SELF_HOSTED_RUNNER_EC2_KEY_NAME }} ubuntu@$PUBLIC_IP "cd actions-runner/ && ./shell.sh \"${{ env.WORKFLOW_NAME }}\" \"${{ env.WORKFLOW_NAME }}\" \"${{ secrets.WORKFLOW_PAT_TOKEN }}\" \"${{ secrets.TARGET_REPO_NAME }}\" && sleep 10"
+          fi
+  debug-release-info:
+    name: Debug Release Information
+    needs: [create-ec2-runner]
+    runs-on: ${{ needs.create-ec2-runner.outputs.workflow_name }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+        with:
+          fetch-depth: 0  # Fetch all history for all branches and tags
+          
+      - name: Debug Release Event
+        run: |
+          echo "Event Name: ${{ github.event_name }}"
+          echo "Release Tag Name: ${{ github.event.release.tag_name }}"
+          echo "Target Commitish: ${{ github.event.release.target_commitish }}"
+          echo "SHA: ${{ github.sha }}"
+          echo "REF: ${{ github.ref }}"
+          echo "Release ID: ${{ github.event.release.id }}"
+          echo "Created At: ${{ github.event.release.created_at }}"
+          echo "Published At: ${{ github.event.release.published_at }}"
+          
+          # Get the commit SHA from the tag
+          git fetch --all --tags
+          COMMIT_SHA=$(git rev-list -n 1 ${{ github.event.release.tag_name }})
+          echo "Commit SHA from tag: ${COMMIT_SHA}"
+          
+  handle-release-tag:
+    name: Check and Add Release Tag
+    needs: [create-ec2-runner, debug-release-info]
+    runs-on: ${{ needs.create-ec2-runner.outputs.workflow_name }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+        with:
+          fetch-depth: 0  # Fetch all history
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v1
+        with:
+          role-to-assume: ${{ secrets.JOSYS_AWS_BUILD_ROLE }}
+          aws-region: ${{ secrets.AWS_DEFAULT_REGION }}
+          role-session-name: GitHub-OIDC-TERRAFORM
+
+      - name: Check if Release Tag Exists
+        id: check-release
+        run: |
+          COMMIT_SHA=$(git rev-list -n 1 ${{ github.event.release.tag_name }})
+          
+          # Get the image digest of the commit SHA
+          IMAGE_DIGEST=$(aws ecr describe-images --repository-name "${{ vars.ECR_REPO_NAME }}" \
+            --image-ids imageTag="$COMMIT_SHA" \
+            --query 'imageDetails[0].imageDigest' --output text 2>/dev/null || echo "")
+          if [[ -z "$IMAGE_DIGEST" ]]; then
+            echo "Image for commit SHA $COMMIT_SHA does not exist in ECR. Skipping tag check."
+            echo "release_exists=false" >> $GITHUB_ENV
+            echo "release_exists=false" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+          # Check if the same image digest has a release tag
+          RELEASE_TAG_EXISTS=$(aws ecr describe-images --repository-name "${{ vars.ECR_REPO_NAME }}" \
+            --query "imageDetails[?imageDigest=='$IMAGE_DIGEST'].imageTags" --output json 2>/dev/null | jq -r '.[] | select(.[]=="${{ github.event.release.tag_name }}")')
+          if [[ -n "$RELEASE_TAG_EXISTS" ]]; then
+            echo "Release tag already exists for this commit's image. Skipping tag creation."
+            echo "release_exists=true" >> $GITHUB_ENV
+            echo "release_exists=true" >> $GITHUB_OUTPUT
+          else
+            echo "Release tag does not exist for this commit's image. Proceeding with tagging."
+            echo "release_exists=false" >> $GITHUB_ENV
+            echo "release_exists=false" >> $GITHUB_OUTPUT
+          fi
+      - name: Add Release Tag
+        if: steps.check-release.outputs.release_exists == 'false'
+        run: |
+          COMMIT_SHA=$(git rev-list -n 1 ${{ github.event.release.tag_name }})
+          echo "Adding release tag"
+          aws ecr put-image \
+          --repository-name ${{ vars.ECR_REPO_NAME }} \
+          --image-tag ${{ github.event.release.tag_name }} \
+          --image-manifest "$(aws ecr batch-get-image --repository-name ${{ vars.ECR_REPO_NAME }} --image-ids imageTag=$COMMIT_SHA --query 'images[].imageManifest' --output text)"
+  staging-approval:
+    name: staging Deployment Approval
+    needs: [create-ec2-runner, debug-release-info,handle-release-tag]
+    runs-on: ${{ needs.create-ec2-runner.outputs.workflow_name }}
+    outputs:
+      staging_exists: ${{ steps.check-staging.outputs.staging_exists }}
+    steps:
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v1
+        with:
+          role-to-assume: ${{ secrets.JOSYS_AWS_BUILD_ROLE }}
+          aws-region: ${{ secrets.AWS_DEFAULT_REGION }}
+          role-session-name: GitHub-OIDC-TERRAFORM
+
+      - name: Check if Staging Tag Exists
+        id: check-staging
+        run: |
+          COMMIT_SHA=$(git rev-list -n 1 ${{ github.event.release.tag_name }})
+          
+          # Get the image digest of the commit SHA
+          IMAGE_DIGEST=$(aws ecr describe-images --repository-name "${{ vars.ECR_REPO_NAME }}" \
+            --image-ids imageTag="$COMMIT_SHA" \
+            --query 'imageDetails[0].imageDigest' --output text 2>/dev/null || echo "")
+            if [[ -z "$IMAGE_DIGEST" ]]; then
+            echo "Image for commit SHA $COMMIT_SHA does not exist in ECR. Skipping tag check."
+            echo "staging_exists=false" >> $GITHUB_ENV
+            echo "staging_exists=false" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+      
+          # Check if the same image digest has a staging tag
+          STAGING_TAG_EXISTS=$(aws ecr describe-images --repository-name ${{ vars.ECR_REPO_NAME }} \
+            --query "imageDetails[?imageDigest=='$IMAGE_DIGEST'].imageTags" --output json 2>/dev/null | jq -r '.[] | select(.[]=="staging")')
+      
+          if [[ -n "$STAGING_TAG_EXISTS" ]]; then
+            echo "Staging tag already exists for this commit's image. Skipping approval."
+            echo "staging_exists=true" >> $GITHUB_ENV
+            echo "staging_exists=true" >> $GITHUB_OUTPUT
+          else
+            echo "Staging tag does not exist for this commit's image. Approval required."
+            echo "staging_exists=false" >> $GITHUB_ENV
+            echo "staging_exists=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Manual Approval for staging
+        id: staging-approval
+        if: steps.check-staging.outputs.staging_exists == 'false'
+        uses: trstringer/manual-approval@v1
+        timeout-minutes: 15
+        continue-on-error: true
+        with:
+          secret: ${{ secrets.WORKFLOW_PAT_TOKEN }}
+          approvers: ${{ secrets.STAGING_APPROVERS }}
+          minimum-approvals: ${{ secrets.STAGING_MINIMUM_APPROVALS }}
+          message: 'Please approve deployment to staging'
+          issue-title: 'STAGING Deployment Approval Required'
+          issue-body: |
+            A new deployment to staging requires your approval.
+            
+            Release Tag: ${{ github.event.release.tag_name }}
+            Triggered by: ${{ github.actor }}
+            Workflow: ${{ github.workflow }}
+            
+            Please review and respond with one of:
+            - "approved" or "lgtm" to approve
+            - "denied" or "no" to reject
+
+            **Workflow Run:**  
+            https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        
+      - name: Stop EC2 and Fail Workflow if Staging is not approved
+        if: steps.staging-approval.outcome != 'success' && steps.check-staging.outputs.staging_exists == 'false'
+        run: |
+            echo "Staging Approval was not received within timeout period. Stopping the EC2 instance and failing the workflow."
+            aws ec2 stop-instances --instance-ids ${{ needs.create-ec2-runner.outputs.instance_id }}
+            aws ec2 wait instance-stopped --instance-ids ${{ needs.create-ec2-runner.outputs.instance_id }}
+            echo "EC2 instance stopped"
+            exit 1
+            
+  promote-to-staging:
+    name: Tag as staging
+    needs: [create-ec2-runner, debug-release-info,handle-release-tag,staging-approval]
+    if: needs.staging-approval.result == 'success'
+    runs-on: ${{ needs.create-ec2-runner.outputs.workflow_name }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+        with:
+          fetch-depth: 0  # Fetch all history
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v1
+        with:
+          role-to-assume: ${{ secrets.JOSYS_AWS_BUILD_ROLE }}
+          aws-region: ${{ secrets.AWS_DEFAULT_REGION }}
+          role-session-name: GitHub-OIDC-TERRAFORM
+
+      - name: Get commit SHA and tag image
+        if: needs.staging-approval.outputs.staging_exists == 'false'
+        env:
+          ECR_REGISTRY: ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_DEFAULT_REGION }}.amazonaws.com
+        run: |
+          # Get the actual commit SHA that the tag points to
+          COMMIT_SHA=$(git rev-list -n 1 ${{ github.event.release.tag_name }})
+          echo "Using commit SHA: ${COMMIT_SHA}"
+          
+          # Try to tag the image
+          if ! aws ecr batch-get-image --repository-name ${{ vars.ECR_REPO_NAME }} --image-ids imageTag=${COMMIT_SHA} >/dev/null 2>&1; then
+            echo "Image with tag ${COMMIT_SHA} not found, trying with short SHA..."
+            SHORT_SHA=${COMMIT_SHA:0:7}
+            if ! aws ecr batch-get-image --repository-name ${{ vars.ECR_REPO_NAME }} --image-ids imageTag=${SHORT_SHA} >/dev/null 2>&1; then
+              echo "Image not found with either full or short SHA"
+              exit 1
+            else
+              COMMIT_SHA=${SHORT_SHA}
+            fi
+          fi
+          echo "Tagging image with SHA ${COMMIT_SHA} as staging"
+          aws ecr put-image \
+          --repository-name ${{ vars.ECR_REPO_NAME }} \
+          --image-tag staging \
+          --image-manifest "$(aws ecr batch-get-image --repository-name ${{ vars.ECR_REPO_NAME }} --image-ids imageTag=$COMMIT_SHA --query 'images[].imageManifest' --output text)"
+  staging-ssm-parameters:
+    needs: [create-ec2-runner, debug-release-info,handle-release-tag,staging-approval,promote-to-staging]
+    runs-on: ${{ needs.create-ec2-runner.outputs.workflow_name }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v1
+        with:
+          role-to-assume: ${{ secrets.JOSYS_AWS_STAGING_DEPLOY_ROLE }}
+          aws-region: ${{ secrets.AWS_DEFAULT_REGION }}
+          role-session-name: GitHub-OIDC-TERRAFORM
+
+      - name: Install dependencies         
+        run: |    
+          sudo apt-get update       
+          sudo apt-get install -y jq python3 python3-full pipx
+          # Create a virtual environment for Python packages
+          python3 -m venv .venv
+          # Activate the virtual environment and install packages
+          source .venv/bin/activate
+          pip install boto3 termcolor  
+
+      - name: Run script and process output
+        id: set-matrix
+        run: |
+          git clone https://${{ vars.USER_NAME }}:${{ secrets.WORKFLOW_PAT_TOKEN }}@github.com/josys-src/container-promotion-template.git
+          cp container-promotion-template/ssm_python.py .           
+          cp container-promotion-template/ssm_table.sh .           
+          chmod +x ssm_table.sh
+          chmod +x ssm_python.py
+          # Use Python from the virtual environment
+          source .venv/bin/activate
+          OUTPUT=$(python ssm_python.py staging 2>&1 | tee /dev/stderr)
+          echo "Script output:"
+          echo "$OUTPUT"
+          SERVICE_NAMES=$(echo "$OUTPUT" | grep -E "service_name :" | sed -E 's/.*\[(.*)\].*/\1/')
+          TASK_DEF_ARNS=$(echo "$OUTPUT" | grep -E "task_def_arn:" | sed -E 's/.*\[(.*)\].*/\1/')
+          IFS=',' read -ra SERVICES <<< "$SERVICE_NAMES"
+          IFS=',' read -ra ARNS <<< "$TASK_DEF_ARNS"
+          MATRIX_JSON="{\"include\":["
+          for i in "${!SERVICES[@]}"; do
+            service=$(echo "${SERVICES[$i]}" | xargs)
+            arn=$(echo "${ARNS[$i]}" | xargs)
+            if [ $i -gt 0 ]; then
+              MATRIX_JSON+=","
+            fi
+            MATRIX_JSON+="{\"service\":\"$service\",\"task_def_arn\":\"$arn\"}"
+          done
+          MATRIX_JSON+="]}"
+          mkdir -p .github/matrix
+          echo "$MATRIX_JSON" > .github/matrix/staging_matrix.json
+          
+      - name: Upload matrix.json artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: staging-matrix
+          path: .github/matrix/staging_matrix.json
+
+  staging-prepare-matrix:
+    needs: [create-ec2-runner, debug-release-info,handle-release-tag,staging-approval,promote-to-staging,staging-ssm-parameters]
+    runs-on: ${{ needs.create-ec2-runner.outputs.workflow_name }}
+    outputs:
+      matrix: ${{ steps.set-matrix.outputs.matrix }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Download matrix.json artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: staging-matrix
+          path: .
+
+      - name: Read and transform config.json
+        id: set-matrix
+        run: |
+          matrix=$(jq -c '{ include: .include }' staging_matrix.json)
+          echo "matrix=$matrix" >> $GITHUB_OUTPUT
+
+  deploy-on-staging:
+    needs: [create-ec2-runner, debug-release-info,handle-release-tag,staging-approval,promote-to-staging,staging-ssm-parameters,staging-prepare-matrix]
+    name: Deploy ${{ matrix.service }}
+    runs-on: ${{ needs.create-ec2-runner.outputs.workflow_name }}
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.staging-prepare-matrix.outputs.matrix) }}
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v1
+        with:
+          role-to-assume: ${{ secrets.JOSYS_AWS_STAGING_DEPLOY_ROLE }}
+          aws-region: ${{ secrets.AWS_DEFAULT_REGION }}
+          role-session-name: GitHub-OIDC-TERRAFORM
+
+      - name: Get latest task definition ARN from service
+        if: needs.staging-approval.outputs.staging_exists == 'false'
+        id: get-taskdef
+        run: |
+          aws ecs describe-task-definition \
+            --task-definition ${{ matrix.task_def_arn }} \
+            --query taskDefinition > ${{ matrix.service }}-task-definition.json
+      - name: Render task definition
+        if: needs.staging-approval.outputs.staging_exists == 'false'
+        id: render-taskdef
+        uses: aws-actions/amazon-ecs-render-task-definition@v1
+        with:
+          task-definition: ${{ matrix.service }}-task-definition.json
+          container-name: ${{ vars.CONTAINER_NAME }}
+          image: ${{ secrets.REPOSITORY_URI }}:staging
+
+      - name: Deploy ECS service
+        if: needs.staging-approval.outputs.staging_exists == 'false'
+        uses: aws-actions/amazon-ecs-deploy-task-definition@v2
+        with:
+          task-definition: ${{ steps.render-taskdef.outputs.task-definition }}
+          service: ${{ matrix.service }}
+          cluster: ${{ vars.STAGING_CLUSTER_NAME}}
+          wait-for-service-stability: true
+
+      - name: Dump ECS logs if deploy fails
+        if: failure()
+        run: |
+          arn="${{ matrix.task_def_arn }}"
+          TASK_DEF_NAME=$(echo "$arn" | cut -d '/' -f2 | cut -d ':' -f1)
+          echo "Extracted Task Definition Name: $TASK_DEF_NAME"
+          LOG_GROUP_NAME=$(aws ecs describe-task-definition \
+            --task-definition $TASK_DEF_NAME \
+            --query 'taskDefinition.containerDefinitions[0].logConfiguration.options."awslogs-group"' \
+            --output text)
+          LOG_STREAM_NAME=$(aws logs describe-log-streams \
+            --log-group-name "$LOG_GROUP_NAME" \
+            --order-by LastEventTime \
+            --descending \
+            --limit 1 \
+            --query 'logStreams[0].logStreamName' \
+            --output text)
+          echo "=== Logs for ${{ matrix.service }} ==="
+          aws logs get-log-events \
+            --log-group-name "$LOG_GROUP_NAME" \
+            --log-stream-name "$LOG_STREAM_NAME" \
+            --limit 20 \
+            --query 'events[*].message' \
+            --output text
+              
+  prod-approval:
+    name: prod Deployment Approval
+    needs: [create-ec2-runner, debug-release-info,handle-release-tag,staging-approval,promote-to-staging,deploy-on-staging,staging-ssm-parameters,staging-prepare-matrix]
+    if: needs.promote-to-staging.result == 'success' 
+    runs-on: ${{ needs.create-ec2-runner.outputs.workflow_name }}
+    outputs:
+      prod_exists: ${{ steps.check-prod.outputs.prod_exists }}
+    steps:
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v1
+        with:
+          role-to-assume: ${{ secrets.JOSYS_AWS_BUILD_ROLE }}
+          aws-region: ${{ secrets.AWS_DEFAULT_REGION }}
+          role-session-name: GitHub-OIDC-TERRAFORM
+
+      - name: Check if Production Tag Exists
+        id: check-prod
+        run: |
+          COMMIT_SHA=$(git rev-list -n 1 ${{ github.event.release.tag_name }})
+          
+          # Get the image digest of the commit SHA
+          IMAGE_DIGEST=$(aws ecr describe-images --repository-name "${{ vars.ECR_REPO_NAME }}" \
+            --image-ids imageTag="$COMMIT_SHA" \
+            --query 'imageDetails[0].imageDigest' --output text 2>/dev/null || echo "")
+          if [[ -z "$IMAGE_DIGEST" ]]; then
+            echo "Image for commit SHA $COMMIT_SHA does not exist in ECR. Skipping tag check."
+            echo "prod_exists=false" >> $GITHUB_ENV
+            echo "prod_exists=false" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+          
+          # Check if the same image digest has a production tag
+          PROD_TAG_EXISTS=$(aws ecr describe-images --repository-name "${{ vars.ECR_REPO_NAME }}" \
+            --query "imageDetails[?imageDigest=='$IMAGE_DIGEST'].imageTags" --output json 2>/dev/null | jq -r '.[] | select(.[]=="production")')
+          
+          if [[ -n "$PROD_TAG_EXISTS" ]]; then
+            echo "Production tag already exists for this commit's image. Skipping approval."
+            echo "prod_exists=true" >> $GITHUB_ENV
+            echo "prod_exists=true" >> $GITHUB_OUTPUT
+          else
+            echo "Production tag does not exist for this commit's image. Approval required."
+            echo "prod_exists=false" >> $GITHUB_ENV
+            echo "prod_exists=false" >> $GITHUB_OUTPUT
+          fi
+          
+      - name: Manual Approval for prod
+        id: prod-approval
+        if: steps.check-prod.outputs.prod_exists == 'false'
+        uses: trstringer/manual-approval@v1
+        timeout-minutes: 15
+        continue-on-error: true
+        with:
+            secret: ${{ secrets.WORKFLOW_PAT_TOKEN }}
+            approvers: ${{ secrets.PRODUCTION_APPROVERS }}
+            minimum-approvals: ${{ secrets.PRODUCTION_MINIMUM_APPROVALS }}
+            message: 'Please approve deployment to prod'
+            issue-title: 'prod Deployment Approval Required'
+            issue-body: |
+                A new deployment to prod requires your approval.
+                
+                Release Tag: ${{ github.event.release.tag_name }}
+                Triggered by: ${{ github.actor }}
+                Workflow: ${{ github.workflow }}
+                
+                Please review and respond with one of:
+                - "approved" or "lgtm" to approve
+                - "denied" or "no" to reject
+              
+                **Workflow Run:**  
+                https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+      - name: Stop EC2 and Fail Workflow if prod is not approved
+        if: steps.prod-approval.outcome != 'success' && steps.check-prod.outputs.prod_exists == 'false'
+        run: |
+            echo "Production Approval was not received within timeout period. Stopping the EC2 instance and failing the workflow."
+            aws ec2 stop-instances --instance-ids ${{ needs.create-ec2-runner.outputs.instance_id }}
+            aws ec2 wait instance-stopped --instance-ids ${{ needs.create-ec2-runner.outputs.instance_id }}
+            echo "EC2 instance stopped"
+            exit 1
+  promote-to-prod:
+    name: Tag as prod
+    needs: [create-ec2-runner, debug-release-info,handle-release-tag,staging-approval,promote-to-staging,deploy-on-staging,prod-approval,staging-ssm-parameters,staging-prepare-matrix]
+    if: needs.prod-approval.result == 'success'
+    runs-on: ${{ needs.create-ec2-runner.outputs.workflow_name }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+        with:
+          fetch-depth: 0  # Fetch all history
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v1
+        with:
+          role-to-assume: ${{ secrets.JOSYS_AWS_BUILD_ROLE }}
+          aws-region: ${{ secrets.AWS_DEFAULT_REGION }}
+          role-session-name: GitHub-OIDC-TERRAFORM
+
+      - name: Get commit SHA and tag image
+        if: needs.prod-approval.outputs.prod_exists == 'false'
+        env:
+          ECR_REGISTRY: ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_DEFAULT_REGION }}.amazonaws.com
+        run: |
+          # Get the actual commit SHA that the tag points to
+          COMMIT_SHA=$(git rev-list -n 1 ${{ github.event.release.tag_name }})
+          echo "Using commit SHA: ${COMMIT_SHA}"
+          
+          # Try to tag the image
+          if ! aws ecr batch-get-image --repository-name ${{ vars.ECR_REPO_NAME }} --image-ids imageTag=${COMMIT_SHA} >/dev/null 2>&1; then
+            echo "Image with tag ${COMMIT_SHA} not found, trying with short SHA..."
+            SHORT_SHA=${COMMIT_SHA:0:7}
+            if ! aws ecr batch-get-image --repository-name ${{ vars.ECR_REPO_NAME }} --image-ids imageTag=${SHORT_SHA} >/dev/null 2>&1; then
+              echo "Image not found with either full or short SHA"
+              exit 1
+            else
+              COMMIT_SHA=${SHORT_SHA}
+            fi
+          fi
+          echo "Tagging image with SHA ${COMMIT_SHA} as prod"
+          aws ecr put-image \
+          --repository-name ${{ vars.ECR_REPO_NAME }} \
+          --image-tag production \
+          --image-manifest "$(aws ecr batch-get-image --repository-name ${{ vars.ECR_REPO_NAME }} --image-ids imageTag=$COMMIT_SHA --query 'images[].imageManifest' --output text)"
+  production-ssm-parameters:
+    needs: [create-ec2-runner, debug-release-info,handle-release-tag,staging-approval,promote-to-staging,deploy-on-staging,prod-approval,staging-ssm-parameters,staging-prepare-matrix,promote-to-prod]
+    runs-on: ${{ needs.create-ec2-runner.outputs.workflow_name }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v1
+        with:
+          role-to-assume: ${{ secrets.JOSYS_AWS_DEPLOY_ROLE }}
+          aws-region: ${{ secrets.AWS_DEFAULT_REGION }}
+          role-session-name: GitHub-OIDC-TERRAFORM
+
+      - name: Install dependencies         
+        run: |    
+          sudo apt-get update       
+          sudo apt-get install -y jq python3 python3-full pipx
+          # Create a virtual environment for Python packages
+          python3 -m venv .venv
+          # Activate the virtual environment and install packages
+          source .venv/bin/activate
+          pip install boto3 termcolor
+
+      - name: Run script and process output
+        id: set-matrix
+        run: |
+          mkdir ssm
+          cd ssm
+          git clone https://${{ vars.USER_NAME }}:${{ secrets.WORKFLOW_PAT_TOKEN }}@github.com/josys-src/container-promotion-template.git
+          cd ..
+          cp ssm/container-promotion-template/ssm_python.py .           
+          cp ssm/container-promotion-template/ssm_table.sh .           
+          chmod +x ssm_table.sh
+          chmod +x ssm_python.py
+          # Use Python from the virtual environment
+          source .venv/bin/activate
+          OUTPUT=$(python ssm_python.py production 2>&1 | tee /dev/stderr)
+          echo "Script output:"
+          echo "$OUTPUT"
+          SERVICE_NAMES=$(echo "$OUTPUT" | grep -E "service_name :" | sed -E 's/.*\[(.*)\].*/\1/')
+          TASK_DEF_ARNS=$(echo "$OUTPUT" | grep -E "task_def_arn:" | sed -E 's/.*\[(.*)\].*/\1/')
+          IFS=',' read -ra SERVICES <<< "$SERVICE_NAMES"
+          IFS=',' read -ra ARNS <<< "$TASK_DEF_ARNS"
+          MATRIX_JSON="{\"include\":["
+          for i in "${!SERVICES[@]}"; do
+            service=$(echo "${SERVICES[$i]}" | xargs)
+            arn=$(echo "${ARNS[$i]}" | xargs)
+            if [ $i -gt 0 ]; then
+              MATRIX_JSON+=","
+            fi
+            MATRIX_JSON+="{\"service\":\"$service\",\"task_def_arn\":\"$arn\"}"
+          done
+          MATRIX_JSON+="]}"
+          mkdir -p .github/matrix
+          echo "$MATRIX_JSON" > .github/matrix/production_matrix.json
+          
+      - name: Upload matrix.json artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: production-matrix
+          path: .github/matrix/production_matrix.json
+
+  production-prepare-matrix:
+    needs: [create-ec2-runner, debug-release-info,handle-release-tag,staging-approval,promote-to-staging,deploy-on-staging,prod-approval,staging-ssm-parameters,staging-prepare-matrix,promote-to-prod,production-ssm-parameters]
+    runs-on: ${{ needs.create-ec2-runner.outputs.workflow_name }}
+    outputs:
+      matrix: ${{ steps.set-matrix.outputs.matrix }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Download matrix.json artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: production-matrix
+          path: .
+
+      - name: Read and transform config.json
+        id: set-matrix
+        run: |
+          matrix=$(jq -c '{ include: .include }' production_matrix.json)
+          echo "matrix=$matrix" >> $GITHUB_OUTPUT
+          
+  deploy-on-production:
+    needs: [create-ec2-runner, debug-release-info,handle-release-tag,staging-approval,promote-to-staging,deploy-on-staging,prod-approval,promote-to-prod,staging-ssm-parameters,staging-prepare-matrix,production-ssm-parameters,production-prepare-matrix]  
+    name: Deploy-${{ matrix.service }}
+    runs-on: ${{ needs.create-ec2-runner.outputs.workflow_name }}
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.production-prepare-matrix.outputs.matrix) }}
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v1
+        with:
+          role-to-assume: ${{ secrets.JOSYS_AWS_DEPLOY_ROLE }}
+          aws-region: ${{ secrets.AWS_DEFAULT_REGION }}
+          role-session-name: GitHub-OIDC-TERRAFORM
+
+      - name: Get latest task definition ARN from service
+        id: get-taskdef
+        run: |
+          aws ecs describe-task-definition \
+            --task-definition ${{ matrix.task_def_arn }} \
+            --query taskDefinition > ${{ matrix.service }}-task-definition.json
+            
+      - name: Render task definition
+        id: render-taskdef
+        uses: aws-actions/amazon-ecs-render-task-definition@v1
+        with:
+          task-definition: ${{ matrix.service }}-task-definition.json
+          container-name: ${{ vars.CONTAINER_NAME }}
+          image: ${{ secrets.REPOSITORY_URI }}:production
+
+      - name: Deploy ECS service
+        uses: aws-actions/amazon-ecs-deploy-task-definition@v2
+        with:
+          task-definition: ${{ steps.render-taskdef.outputs.task-definition }}
+          service: ${{ matrix.service }}
+          cluster: ${{ vars.PRODUCTION_CLUSTER_NAME}}
+          wait-for-service-stability: true
+
+      - name: Dump ECS logs if deploy fails
+        if: failure()
+        run: |
+          arn="${{ matrix.task_def_arn }}"
+          TASK_DEF_NAME=$(echo "$arn" | cut -d '/' -f2 | cut -d ':' -f1)
+          echo "Extracted Task Definition Name: $TASK_DEF_NAME"
+          LOG_GROUP_NAME=$(aws ecs describe-task-definition \
+            --task-definition $TASK_DEF_NAME \
+            --query 'taskDefinition.containerDefinitions[0].logConfiguration.options."awslogs-group"' \
+            --output text)
+          LOG_STREAM_NAME=$(aws logs describe-log-streams \
+            --log-group-name "$LOG_GROUP_NAME" \
+            --order-by LastEventTime \
+            --descending \
+            --limit 1 \
+            --query 'logStreams[0].logStreamName' \
+            --output text)
+          echo "=== Logs for ${{ matrix.service }} ==="
+          aws logs get-log-events \
+            --log-group-name "$LOG_GROUP_NAME" \
+            --log-stream-name "$LOG_STREAM_NAME" \
+            --limit 20 \
+            --query 'events[*].message' \
+            --output text
+  summary-report:
+    name: Summary-Report
+    needs: [create-ec2-runner, debug-release-info,handle-release-tag,staging-approval,promote-to-staging,deploy-on-staging,prod-approval,promote-to-prod,deploy-on-production,staging-ssm-parameters,staging-prepare-matrix,production-ssm-parameters,production-prepare-matrix]
+    runs-on: ${{ needs.create-ec2-runner.outputs.workflow_name }}
+    steps:
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v1
+        with:
+          role-to-assume: ${{ secrets.JOSYS_AWS_BUILD_ROLE }}
+          aws-region: ${{ secrets.AWS_DEFAULT_REGION }}
+          role-session-name: GitHub-OIDC-TERRAFORM
+
+      - name: Generate Summary Report for Release
+        run: |
+            echo "## 🚀 Production Deployment Summary" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "| **Field**            | **Details** |" >> $GITHUB_STEP_SUMMARY
+            echo "|----------------------|------------|" >> $GITHUB_STEP_SUMMARY
+            echo "| 🏷️ **Release Tag**   | \`${{ github.event.release.tag_name }}\` |" >> $GITHUB_STEP_SUMMARY
+            echo "| 🔗 **Repository**    | [${{ github.repository }}](https://github.com/${{ github.repository }}) |" >> $GITHUB_STEP_SUMMARY
+            echo "| 👤 **Triggered By**  | \`${{ github.actor }}\` |" >> $GITHUB_STEP_SUMMARY
+            echo "| 📅 **Deployment Time** | \`$(date)\` |" >> $GITHUB_STEP_SUMMARY
+            echo "| 🔖 **Commit SHA**    | \`${{ github.sha }}\` |" >> $GITHUB_STEP_SUMMARY
+            echo "| 🌍 **AWS Region**    | \`${{ secrets.AWS_DEFAULT_REGION }}\` |" >> $GITHUB_STEP_SUMMARY
+            echo "| 📦 **ECR Repository** | \`${{ vars.ECR_REPO_NAME }}\` |" >> $GITHUB_STEP_SUMMARY
+            IMAGE_DIGEST=$(aws ecr describe-images --repository-name ${{ vars.ECR_REPO_NAME }} --image-ids imageTag=${{ github.event.release.tag_name }} --query 'imageDetails[0].imageDigest' --output text)
+            
+            echo "| 🖼️ **Image Digest**  | \`${IMAGE_DIGEST}\` |" >> $GITHUB_STEP_SUMMARY
+            echo "| 🛠️ **Image Tagged as** | \`${{ github.event.release.tag_name }}\` |" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "---" >> $GITHUB_STEP_SUMMARY
+            echo ":white_check_mark: **Deployment to staging & production is complete!** 🎉" >> $GITHUB_STEP_SUMMARY
+            echo ":rocket: The image has been successfully deployed to ECS Cluster" >> $GITHUB_STEP_SUMMARY
+  remove-runner-and-terminate-release:
+    name: "Remove Runner & Terminate EC2"
+    needs: [create-ec2-runner, debug-release-info,handle-release-tag,staging-approval,promote-to-staging,deploy-on-staging,prod-approval,promote-to-prod,deploy-on-production,summary-report,staging-ssm-parameters,staging-prepare-matrix,production-ssm-parameters,production-prepare-matrix]
+    if: github.event_name == 'release'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v1
+        with:
+          role-to-assume: ${{ secrets.JOSYS_AWS_BUILD_ROLE }}
+          aws-region: ${{ secrets.AWS_DEFAULT_REGION }}
+          role-session-name: GitHub-OIDC-TERRAFORM
+
+      - name: Fetch EC2 Public IP
+        id: fetch-public-ip
+        run: |
+          PUBLIC_IP=$(aws ec2 describe-instances \
+            --filters "Name=tag:Name,Values=${{ env.WORKFLOW_NAME }}" "Name=instance-state-name,Values=running" \
+            --query 'Reservations[0].Instances[0].PublicIpAddress' --output text)
+          echo "public_ip=$PUBLIC_IP" >> $GITHUB_ENV
+          echo "public_ip:$PUBLIC_IP"
+      - name: Create working directory
+        run: mkdir -p ~/runner_setup && cd ~/runner_setup
+          
+      - name: Run Removal Script on EC2
+        run: |
+          echo "${{ secrets.SELF_HOSTED_RUNNER_SSH_KEY }}" > ~/runner_setup/${{ secrets.SELF_HOSTED_RUNNER_EC2_KEY_NAME }}
+          chmod 600 ~/runner_setup/${{ secrets.SELF_HOSTED_RUNNER_EC2_KEY_NAME }}
+          mkdir -p ~/.ssh
+          echo "StrictHostKeyChecking no" > ~/.ssh/config
+          ssh -i ~/runner_setup/${{ secrets.SELF_HOSTED_RUNNER_EC2_KEY_NAME }} ubuntu@${{ env.public_ip }} << 'EOF'
+          # Update package list
+          cd actions-runner/
+          ./removal.sh "${{ env.WORKFLOW_NAME }}" "${{ secrets.WORKFLOW_PAT_TOKEN }}" "${{ secrets.TARGET_REPO_NAME }}"
+          # Wait for service to start
+          sleep 10
+          EOF
+      - name: Terminate EC2 Instance
+        run: |
+          aws ec2 terminate-instances --instance-ids ${{ needs.create-ec2-runner.outputs.instance_id }}
+          aws ec2 wait instance-terminated --instance-ids ${{ needs.create-ec2-runner.outputs.instance_id }}
+          echo "EC2 Instance Terminated"

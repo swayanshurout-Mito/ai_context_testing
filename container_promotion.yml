@@ -1,0 +1,8 @@
+version: 0.2
+phases:
+  post_build:
+    commands:
+      - printf '[{"name":"%s","imageUri":"%s"}]' "$(if [ "$RUNTIME_CONFIG" = "production" ] || [ "$RUNTIME_CONFIG" = "staging" ]; then echo "{container_name}"; else echo "{container_name}"; fi)" $REPOSITORY_URI:$ENV > imagedefinitions.json
+artifacts:
+    files:
+      - imagedefinitions.json
