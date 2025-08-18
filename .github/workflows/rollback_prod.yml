@@ -1,0 +1,479 @@
+name: Prod-Rollback-Deployment
+
+on:
+  workflow_dispatch:
+    inputs:
+      commit_sha:
+        description: "Commit SHA for tagging the ECR image"
+        required: false
+        default: ""
+      release_tag:
+        description: "Release tag for tagging the ECR image"
+        required: false
+        default: ""
+      rollback_reason:
+        description: "Reason for rollback"
+        required: true
+        default: "No reason provided"
+
+permissions:
+  id-token: write
+  contents: read
+  pull-requests: write
+  issues: write
+  discussions: write
+
+env:
+  WORKFLOW_NAME: rollback-{service-abbreviation}-${{ github.workflow_sha }}
+
+
+jobs:
+  create-ec2-runner:
+    name: "Start EC2 and Register Runner"
+    runs-on: ubuntu-latest
+    outputs:
+      instance_id: ${{ steps.launch-ec2.outputs.instance_id }}
+      public_ip: ${{ steps.launch-ec2.outputs.public_ip }}
+      workflow_name: ${{ env.WORKFLOW_NAME }}
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v1
+        with:
+          role-to-assume: ${{ secrets.JOSYS_AWS_BUILD_ROLE }}
+          aws-region: ${{ secrets.AWS_DEFAULT_REGION }}
+          role-session-name: GitHub-OIDC-TERRAFORM
+
+      - name: Create working directory
+        run: mkdir -p ~/runner_setup
+  
+      - name: Check EC2 Instance and ECR Image
+        id: launch-ec2
+        run: |
+            # Check for existing EC2 instance
+            INSTANCE_JSON=$(aws ec2 describe-instances \
+                --filters "Name=tag:Name,Values=${{ env.WORKFLOW_NAME }}" "Name=instance-state-name,Values=running,stopped" \
+                --query 'Reservations[*].Instances[*].{InstanceId:InstanceId,State:State.Name,PublicIp:PublicIpAddress}' \
+                --output json)
+
+            INSTANCE_COUNT=$(echo $INSTANCE_JSON | jq 'length')
+            echo "Found $INSTANCE_COUNT instances with name ${{ env.WORKFLOW_NAME }}"
+
+            if [ "$INSTANCE_COUNT" -gt "0" ]; then
+                INSTANCE_ID=$(echo $INSTANCE_JSON | jq -r '.[0][0].InstanceId')
+                PUBLIC_IP=$(echo $INSTANCE_JSON | jq -r '.[0][0].PublicIp')
+                INSTANCE_STATE=$(echo $INSTANCE_JSON | jq -r '.[0][0].State')
+
+                echo "Instance ID: $INSTANCE_ID"
+                echo "Public IP: $PUBLIC_IP"
+                echo "Instance State: $INSTANCE_STATE"
+
+                if [ "$INSTANCE_STATE" == "stopped" ]; then
+                echo "Starting stopped instance: $INSTANCE_ID"
+                aws ec2 start-instances --instance-ids $INSTANCE_ID
+                aws ec2 wait instance-running --instance-ids $INSTANCE_ID
+                PUBLIC_IP=$(aws ec2 describe-instances --instance-ids $INSTANCE_ID \
+                    --query 'Reservations[0].Instances[0].PublicIpAddress' --output text)
+                fi
+
+                echo "instance_id=$INSTANCE_ID" >> $GITHUB_OUTPUT
+                echo "public_ip=$PUBLIC_IP" >> $GITHUB_OUTPUT
+            else
+                echo "No existing instance found, creating a new one."
+                KEY_NAME=$(echo "${{ secrets.SELF_HOSTED_RUNNER_EC2_KEY_NAME }}" | sed 's/\.pem$//')
+                INSTANCE_ID=$(aws ec2 run-instances \
+                --image-id ${{ secrets.SELF_HOSTED_RUNNER_EC2_AMI_ID }} \
+                --instance-type t3a.medium \
+                --key-name "$KEY_NAME" \
+                --security-group-ids ${{ secrets.SELF_HOSTED_RUNNER_EC2_SECURITY_GROUP_ID }} \
+                --subnet-id ${{ secrets.SELF_HOSTED_RUNNER_EC2_SUBNET_ID }} \
+                --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=${{ env.WORKFLOW_NAME }}}]" \
+                --query 'Instances[0].InstanceId' \
+                --output text)
+                aws ec2 wait instance-running --instance-ids $INSTANCE_ID
+                sleep 60
+                PUBLIC_IP=$(aws ec2 describe-instances \
+                --instance-ids $INSTANCE_ID \
+                --query 'Reservations[0].Instances[0].PublicIpAddress' --output text)
+                echo "instance_id=$INSTANCE_ID" >> $GITHUB_OUTPUT
+                echo "public_ip=$PUBLIC_IP" >> $GITHUB_OUTPUT
+                echo "New instance created: $INSTANCE_ID"
+                echo "Public IP: $PUBLIC_IP"
+                # Proceed to register the instance as a self-hosted runner
+                echo "${{ secrets.SELF_HOSTED_RUNNER_SSH_KEY }}" > ~/runner_setup/${{ secrets.SELF_HOSTED_RUNNER_EC2_KEY_NAME }}
+                chmod 600 ~/runner_setup/${{ secrets.SELF_HOSTED_RUNNER_EC2_KEY_NAME }}
+                mkdir -p ~/.ssh
+                echo "StrictHostKeyChecking no" > ~/.ssh/config
+                # Fix the heredoc syntax for SSH
+                ssh -i ~/runner_setup/${{ secrets.SELF_HOSTED_RUNNER_EC2_KEY_NAME }} ubuntu@$PUBLIC_IP "cd actions-runner/ && ./shell.sh \"${{ env.WORKFLOW_NAME }}\" \"${{ env.WORKFLOW_NAME }}\" \"${{ secrets.WORKFLOW_PAT_TOKEN }}\" \"${{ secrets.TARGET_REPO_NAME }}\" && sleep 10"
+            fi
+ 
+  rollback-tag-as-production:
+    name: Rollback-tag-as-Production
+    runs-on: ${{ needs.create-ec2-runner.outputs.workflow_name }}
+    needs: [create-ec2-runner]
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+        with:
+          fetch-depth: 0
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v1
+        with:
+          role-to-assume: ${{ secrets.JOSYS_AWS_BUILD_ROLE }}
+          aws-region: ${{ secrets.AWS_DEFAULT_REGION }}
+          role-session-name: GitHub-OIDC-TERRAFORM
+
+      - name: Determine Image Tag
+        id: determine-tag
+        run: |
+          if [[ -n "${{ github.event.inputs.commit_sha }}" ]]; then
+            IMAGE_TAG=${{ github.event.inputs.commit_sha }}
+            echo "Using Commit SHA: $IMAGE_TAG"
+          elif [[ -n "${{ github.event.inputs.release_tag }}" ]]; then
+            IMAGE_TAG=${{ github.event.inputs.release_tag }}
+            echo "Using Release Tag: $IMAGE_TAG"
+          else
+            echo "Error: Either commit_sha or release_tag must be provided."
+            exit 1
+          fi
+          echo "IMAGE_TAG=$IMAGE_TAG" >> $GITHUB_ENV
+
+      - name: Tag Image as Production
+        run: |
+          if ! aws ecr batch-get-image --repository-name ${{ vars.ECR_REPO_NAME }} --image-ids imageTag=${IMAGE_TAG} >/dev/null 2>&1; then
+            echo "Image with tag ${IMAGE_TAG} not found. Exiting."
+            exit 1
+          fi
+          echo "Tagging image ${IMAGE_TAG} as 'production'"
+          aws ecr put-image \
+            --repository-name ${{ vars.ECR_REPO_NAME }} \
+            --image-tag production \
+            --image-manifest "$(aws ecr batch-get-image \
+              --repository-name ${{ vars.ECR_REPO_NAME }} \
+              --image-ids imageTag=${IMAGE_TAG} \
+              --query 'images[].imageManifest' --output text)"
+
+  production-ssm-parameters:
+    name: production-ssm-parameters
+    needs: [create-ec2-runner,rollback-tag-as-production]
+    runs-on: ${{ needs.create-ec2-runner.outputs.workflow_name }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v1
+        with:
+          role-to-assume: ${{ secrets.JOSYS_AWS_DEPLOY_ROLE }}
+          aws-region: ${{ secrets.AWS_DEFAULT_REGION }}
+          role-session-name: GitHub-OIDC-TERRAFORM
+
+      - name: Install dependencies         
+        run: |   
+          sudo apt-get update        
+          sudo apt-get install -y jq python3 python3-full pipx
+          # Create a virtual environment for Python packages
+          python3 -m venv .venv
+          # Activate the virtual environment and install packages
+          source .venv/bin/activate
+          pip install boto3 termcolor 
+
+      - name: Run script and process output
+        id: set-matrix
+        run: |
+          mkdir ssm
+          cd ssm
+          git clone https://${{ vars.USER_NAME }}:${{ secrets.WORKFLOW_PAT_TOKEN }}@github.com/josys-src/container-promotion-template.git
+          cd ..
+          cp ssm/container-promotion-template/ssm_python.py .           
+          cp ssm/container-promotion-template/ssm_table.sh .          
+          chmod +x ssm_table.sh
+          chmod +x ssm_python.py
+          # Use Python from the virtual environment
+          source .venv/bin/activate
+          OUTPUT=$(python ssm_python.py production 2>&1 | tee /dev/stderr)
+          echo "Script output:"
+          echo "$OUTPUT"
+          SERVICE_NAMES=$(echo "$OUTPUT" | grep -E "service_name :" | sed -E 's/.*\[(.*)\].*/\1/')
+          TASK_DEF_ARNS=$(echo "$OUTPUT" | grep -E "task_def_arn:" | sed -E 's/.*\[(.*)\].*/\1/')
+          IFS=',' read -ra SERVICES <<< "$SERVICE_NAMES"
+          IFS=',' read -ra ARNS <<< "$TASK_DEF_ARNS"
+          MATRIX_JSON="{\"include\":["
+          for i in "${!SERVICES[@]}"; do
+            service=$(echo "${SERVICES[$i]}" | xargs)
+            arn=$(echo "${ARNS[$i]}" | xargs)
+            if [ $i -gt 0 ]; then
+              MATRIX_JSON+=","
+            fi
+            MATRIX_JSON+="{\"service\":\"$service\",\"task_def_arn\":\"$arn\"}"
+          done
+          MATRIX_JSON+="]}"
+          mkdir -p .github/matrix
+          echo "$MATRIX_JSON" > .github/matrix/production_matrix.json
+          
+      - name: Upload matrix.json artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: production-matrix
+          path: .github/matrix/production_matrix.json
+
+  production-prepare-matrix:
+    name: production-prepare-matrix
+    needs: [create-ec2-runner,rollback-tag-as-production,production-ssm-parameters]
+    runs-on: ${{ needs.create-ec2-runner.outputs.workflow_name }}
+    outputs:
+      matrix: ${{ steps.set-matrix.outputs.matrix }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Download matrix.json artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: production-matrix
+          path: .
+
+      - name: Read and transform config.json
+        id: set-matrix
+        run: |
+          matrix=$(jq -c '{ include: .include }' production_matrix.json)
+          echo "matrix=$matrix" >> $GITHUB_OUTPUT
+
+  deploy-on-production:
+    needs: [create-ec2-runner, rollback-tag-as-production,production-ssm-parameters,production-prepare-matrix]
+    name: Deploy-prod ${{ matrix.service }}
+    runs-on: ${{ needs.create-ec2-runner.outputs.workflow_name }}
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.production-prepare-matrix.outputs.matrix) }}
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v1
+        with:
+          role-to-assume: ${{ secrets.JOSYS_AWS_DEPLOY_ROLE }}
+          aws-region: ${{ secrets.AWS_DEFAULT_REGION }}
+          role-session-name: GitHub-OIDC-TERRAFORM
+
+      - name: Get latest task definition ARN from service
+        id: get-taskdef
+        run: |
+          aws ecs describe-task-definition \
+            --task-definition ${{ matrix.task_def_arn }} \
+            --query taskDefinition > ${{ matrix.service }}-task-definition.json
+
+      - name: Render task definition
+        id: render-taskdef
+        uses: aws-actions/amazon-ecs-render-task-definition@v1
+        with:
+          task-definition: ${{ matrix.service }}-task-definition.json
+          container-name: ${{ vars.CONTAINER_NAME }}
+          image: ${{ secrets.REPOSITORY_URI }}:production
+
+      - name: Deploy ECS service
+        uses: aws-actions/amazon-ecs-deploy-task-definition@v2
+        with:
+          task-definition: ${{ steps.render-taskdef.outputs.task-definition }}
+          service: ${{ matrix.service }}
+          cluster: ${{ vars.PRODUCTION_CLUSTER_NAME}}
+          wait-for-service-stability: true
+
+      - name: Dump ECS logs if deploy fails
+        if: failure()
+        run: |
+          arn="${{ matrix.task_def_arn }}"
+          TASK_DEF_NAME=$(echo "$arn" | cut -d '/' -f2 | cut -d ':' -f1)
+          echo "Extracted Task Definition Name: $TASK_DEF_NAME"
+          LOG_GROUP_NAME=$(aws ecs describe-task-definition \
+            --task-definition $TASK_DEF_NAME \
+            --query 'taskDefinition.containerDefinitions[0].logConfiguration.options."awslogs-group"' \
+            --output text)
+
+          LOG_STREAM_NAME=$(aws logs describe-log-streams \
+            --log-group-name "$LOG_GROUP_NAME" \
+            --order-by LastEventTime \
+            --descending \
+            --limit 1 \
+            --query 'logStreams[0].logStreamName' \
+            --output text)
+
+          echo "=== Logs for ${{ matrix.service }} ==="
+          aws logs get-log-events \
+            --log-group-name "$LOG_GROUP_NAME" \
+            --log-stream-name "$LOG_STREAM_NAME" \
+            --limit 20 \
+            --query 'events[*].message' \
+            --output text
+
+  rollback-summary:
+    name: Rollback-summary
+    runs-on: ${{ needs.create-ec2-runner.outputs.workflow_name }}
+    needs: [create-ec2-runner,rollback-tag-as-production,deploy-on-production]
+    steps:
+    
+      - name: Checkout code
+        uses: actions/checkout@v3
+        with:
+          fetch-depth: 0
+
+      - name: Append Rollback Details to GitHub Release
+        if: github.event.inputs.release_tag != ''
+        run: |
+            sudo apt update && sudo apt install gh -y
+            echo "${{ secrets.WORKFLOW_PAT_TOKEN }}" | gh auth login --with-token
+
+            RELEASE_TAG="${{ github.event.inputs.release_tag }}"
+            TIMESTAMP=$(date '+%Y-%m-%d %H:%M:%S')
+            WORKFLOW_LINK="https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+            
+            # Fetch existing release notes
+            EXISTING_NOTES=$(gh release view "$RELEASE_TAG" --repo "${{ github.repository }}" --json body -q ".body")
+
+            # Append rollback details
+            NEW_CONTENT=$'\n\n'"### ⚠️ ROLLBACK UPDATE ($TIMESTAMP)"$'\n'
+            NEW_CONTENT+="Rollback performed by **${{ github.actor }}**."$'\n'
+            NEW_CONTENT+="**Rollback Details:**"$'\n'
+            NEW_CONTENT+="- **ECR Repository:** ${{ vars.ECR_REPO_NAME }}"$'\n'
+            NEW_CONTENT+="- **Image Tag:** production"$'\n'
+            NEW_CONTENT+="- **Workflow Run:** [View Run]($WORKFLOW_LINK)"$'\n'
+            NEW_CONTENT+="- **Rollback Reason:** ${{ github.event.inputs.rollback_reason }}"$'\n'
+
+            # Concatenate old and new notes
+            UPDATED_NOTES="$EXISTING_NOTES$NEW_CONTENT"
+
+            # Update release
+            gh release edit "$RELEASE_TAG" --repo "${{ github.repository }}" --notes "$UPDATED_NOTES" --latest
+
+      - name: Find or Create Rollback Release from Commit SHA
+        if: github.event.inputs.release_tag == '' && github.event.inputs.commit_sha != ''
+        run: |
+            sudo apt update && sudo apt install gh -y
+            echo "${{ secrets.WORKFLOW_PAT_TOKEN }}" | gh auth login --with-token
+
+            COMMIT_SHA="${{ github.event.inputs.commit_sha }}"
+            REPO="${{ github.repository }}"
+            ROLLBACK_REASON="${{ github.event.inputs.rollback_reason }}"
+            ECR_REPOSITORY="${{ vars.ECR_REPO_NAME }}"
+            WORKFLOW_LINK="https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+            TIMESTAMP=$(date '+%Y-%m-%d %H:%M:%S')
+
+            for TAG in $(gh release list --repo "$REPO" --json tagName --jq '.[] | .tagName'); do
+                RELEASE_COMMIT=$(gh api repos/$REPO/git/ref/tags/$TAG --jq '.object.sha' 2>/dev/null || echo "")
+
+                if [[ "$RELEASE_COMMIT" == "$COMMIT_SHA" ]]; then
+                echo "✅ Commit $COMMIT_SHA is part of release: $TAG"
+
+                # Fetch existing release notes
+                EXISTING_NOTES=$(gh release view "$TAG" --repo "$REPO" --json body -q ".body")
+
+                # Append rollback details
+                NEW_CONTENT=$'\n\n'"### ⚠️ ROLLBACK UPDATE ($TIMESTAMP)"$'\n'
+                NEW_CONTENT+="Rollback performed by **${{ github.actor }}**."$'\n'
+                NEW_CONTENT+="**Rollback Details:**"$'\n'
+                NEW_CONTENT+="- **ECR Repository:** ${{ vars.ECR_REPO_NAME }}"$'\n'
+                NEW_CONTENT+="- **Image Tag:** production"$'\n'
+                NEW_CONTENT+="- **Workflow Run:** [View Run]($WORKFLOW_LINK)"$'\n'
+                NEW_CONTENT+="- **Rollback Reason:** $ROLLBACK_REASON"$'\n'
+
+                # Concatenate old and new notes
+                UPDATED_NOTES="$EXISTING_NOTES$NEW_CONTENT"
+
+                # Update release notes
+                gh release edit "$TAG" --repo "$REPO" --notes "$UPDATED_NOTES" --latest
+
+                echo "✅ Release notes updated for $TAG"
+                exit 0
+                fi
+            done
+
+            echo "❌ Commit $COMMIT_SHA is not associated with any release. No action taken."
+            
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v1
+        with:
+          role-to-assume: ${{ secrets.JOSYS_AWS_BUILD_ROLE }}
+          aws-region: ${{ secrets.AWS_DEFAULT_REGION }}
+          role-session-name: GitHub-OIDC-TERRAFORM
+
+      - name: Determine Image Tag
+        id: determine-tag
+        run: |
+            if [[ -n "${{ github.event.inputs.commit_sha }}" ]]; then
+            IMAGE_TAG=${{ github.event.inputs.commit_sha }}
+            echo "Using Commit SHA: $IMAGE_TAG"
+            elif [[ -n "${{ github.event.inputs.release_tag }}" ]]; then
+            IMAGE_TAG=${{ github.event.inputs.release_tag }}
+            echo "Using Release Tag: $IMAGE_TAG"
+            else
+            echo "Error: Either commit_sha or release_tag must be provided."
+            exit 1
+            fi
+            echo "IMAGE_TAG=$IMAGE_TAG" >> $GITHUB_ENV
+
+      - name: Generate Rollback Summary Report
+        run: |
+            echo "## 🔄 Rollback Deployment Summary" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "| **Field**            | **Details** |" >> $GITHUB_STEP_SUMMARY
+            echo "|----------------------|------------|" >> $GITHUB_STEP_SUMMARY
+            echo "| 🔄 **Rollback Triggered By** | \`${{ github.actor }}\` |" >> $GITHUB_STEP_SUMMARY
+            echo "| 🔖 **Rollback Image Tag** | \`${IMAGE_TAG}\` |" >> $GITHUB_STEP_SUMMARY
+            echo "| 📦 **ECR Repository** | \`${{ vars.ECR_REPO_NAME }}\` |" >> $GITHUB_STEP_SUMMARY
+            echo "| 📅 **Rollback Time** | \`$(date)\` |" >> $GITHUB_STEP_SUMMARY
+            echo "| 🌍 **AWS Region**    | \`${{ secrets.AWS_DEFAULT_REGION }}\` |" >> $GITHUB_STEP_SUMMARY
+            echo "| 🔗 **Repository**    | [${{ github.repository }}](https://github.com/${{ github.repository }}) |" >> $GITHUB_STEP_SUMMARY
+            echo "| 🔄 **Rollback Reason** | \`${{ github.event.inputs.rollback_reason }}\` |" >> $GITHUB_STEP_SUMMARY
+
+            IMAGE_DIGEST=$(aws ecr describe-images --repository-name ${{ vars.ECR_REPO_NAME }} --image-ids imageTag=${IMAGE_TAG} --query 'imageDetails[0].imageDigest' --output text)
+            
+            echo "| 🖼️ **Image Digest**  | \`${IMAGE_DIGEST}\` |" >> $GITHUB_STEP_SUMMARY
+            echo "| 🚀 **Image Rolled Back to** | \`${IMAGE_TAG}\` |" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "---" >> $GITHUB_STEP_SUMMARY
+            echo ":warning: **Rollback to previous image is complete!** ⚠️" >> $GITHUB_STEP_SUMMARY
+            echo ":repeat: The production deployment has been rolled back to the last known stable version." >> $GITHUB_STEP_SUMMARY
+      
+  remove-runner-and-terminate-rollback:
+    name: "Remove Runner & Terminate EC2"
+    needs: [create-ec2-runner,rollback-tag-as-production,deploy-on-production,rollback-summary]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v1
+        with:
+          role-to-assume: ${{ secrets.JOSYS_AWS_BUILD_ROLE }}
+          aws-region: ${{ secrets.AWS_DEFAULT_REGION }}
+          role-session-name: GitHub-OIDC-TERRAFORM
+
+      - name: Fetch EC2 Public IP
+        id: fetch-public-ip
+        run: |
+          PUBLIC_IP=$(aws ec2 describe-instances \
+            --filters "Name=tag:Name,Values=${{ env.WORKFLOW_NAME }}" "Name=instance-state-name,Values=running" \
+            --query 'Reservations[0].Instances[0].PublicIpAddress' --output text)
+          echo "public_ip=$PUBLIC_IP" >> $GITHUB_ENV
+          echo "public_ip:$PUBLIC_IP"
+
+      - name: Create working directory
+        run: mkdir -p ~/runner_setup && cd ~/runner_setup
+          
+      - name: Run Removal Script on EC2
+        run: |
+          echo "${{ secrets.SELF_HOSTED_RUNNER_SSH_KEY }}" > ~/runner_setup/${{ secrets.SELF_HOSTED_RUNNER_EC2_KEY_NAME }}
+          chmod 600 ~/runner_setup/${{ secrets.SELF_HOSTED_RUNNER_EC2_KEY_NAME }}
+          mkdir -p ~/.ssh
+          echo "StrictHostKeyChecking no" > ~/.ssh/config
+          ssh -i ~/runner_setup/${{ secrets.SELF_HOSTED_RUNNER_EC2_KEY_NAME }} ubuntu@${{ env.public_ip }} << 'EOF'
+          # Update package list
+          cd actions-runner/
+          ./removal.sh "${{ env.WORKFLOW_NAME }}" "${{ secrets.WORKFLOW_PAT_TOKEN }}" "${{ secrets.TARGET_REPO_NAME }}"
+          # Wait for service to start
+          sleep 10
+          EOF
+
+      - name: Terminate EC2 Instance
+        run: |
+          aws ec2 terminate-instances --instance-ids ${{ needs.create-ec2-runner.outputs.instance_id }}
+          aws ec2 wait instance-terminated --instance-ids ${{ needs.create-ec2-runner.outputs.instance_id }}
+          echo "EC2 Instance Terminated"

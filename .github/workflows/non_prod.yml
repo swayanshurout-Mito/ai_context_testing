@@ -1,0 +1,327 @@
+name: Dev-Build-workflow
+
+on:
+  push:
+    branches:
+      - main
+
+permissions:
+  id-token: write
+  contents: read
+  pull-requests: write
+  issues: write       # Add this permission for creating 
+  discussions: write  # Add this for potential fallback to discussions
+  
+env:
+  WORKFLOW_NAME: ${{ github.sha }}
+  
+jobs:
+  check-ec2-and-ecr:
+    name: "Check and Start EC2, Check ECR Image"
+    runs-on: ubuntu-latest
+    outputs:
+      instance_id: ${{ steps.check.outputs.instance_id }}
+      public_ip: ${{ steps.check.outputs.public_ip }}
+      image_exists: ${{ steps.check.outputs.image_exists }}
+      workflow_name: ${{ env.WORKFLOW_NAME }}
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v1
+        with:
+          role-to-assume: ${{ secrets.JOSYS_AWS_BUILD_ROLE }}
+          aws-region: ${{ secrets.AWS_DEFAULT_REGION }}
+          role-session-name: GitHub-OIDC-TERRAFORM
+
+      - name: Create working directory
+        run: mkdir -p ~/runner_setup
+
+      - name: Check EC2 Instance and ECR Image
+        id: check
+        run: |
+            KEY_NAME=$(echo "${{ secrets.SELF_HOSTED_RUNNER_EC2_KEY_NAME }}" | sed 's/\.pem$//')
+            INSTANCE_ID=$(aws ec2 run-instances \
+              --image-id ${{ secrets.SELF_HOSTED_RUNNER_EC2_AMI_ID }} \
+              --instance-type t3a.medium \
+              --key-name "$KEY_NAME" \
+              --security-group-ids ${{ secrets.SELF_HOSTED_RUNNER_EC2_SECURITY_GROUP_ID }} \
+              --subnet-id ${{ secrets.SELF_HOSTED_RUNNER_EC2_SUBNET_ID }} \
+              --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=dev-{service-abbreviation}-${{ github.sha }}}]" \
+              --query 'Instances[0].InstanceId' \
+              --output text)
+            aws ec2 wait instance-running --instance-ids $INSTANCE_ID
+            sleep 60
+            PUBLIC_IP=$(aws ec2 describe-instances \
+              --instance-ids $INSTANCE_ID \
+              --query 'Reservations[0].Instances[0].PublicIpAddress' --output text)
+            echo "instance_id=$INSTANCE_ID" >> $GITHUB_OUTPUT
+            echo "public_ip=$PUBLIC_IP" >> $GITHUB_OUTPUT
+            echo "New instance created: $INSTANCE_ID"
+            echo "Public IP: $PUBLIC_IP"
+            # Proceed to register the instance as a self-hosted runner
+            echo "${{ secrets.SELF_HOSTED_RUNNER_SSH_KEY }}" > ~/runner_setup/${{ secrets.SELF_HOSTED_RUNNER_EC2_KEY_NAME }}
+            chmod 600 ~/runner_setup/${{ secrets.SELF_HOSTED_RUNNER_EC2_KEY_NAME }}
+            mkdir -p ~/.ssh
+            echo "StrictHostKeyChecking no" > ~/.ssh/config
+            # Fix the heredoc syntax for SSH
+            ssh -i ~/runner_setup/${{ secrets.SELF_HOSTED_RUNNER_EC2_KEY_NAME }} ubuntu@$PUBLIC_IP "cd actions-runner/ && ./shell.sh \"${{ env.WORKFLOW_NAME }}\" \"${{ env.WORKFLOW_NAME }}\" \"${{ secrets.WORKFLOW_PAT_TOKEN }}\" \"${{ secrets.TARGET_REPO_NAME }}\" && sleep 10"
+            # Check if the image exists in ECR
+            IMAGE_EXISTS=$(aws ecr describe-images \
+              --repository-name ${{ vars.ECR_REPO_NAME }} \
+              --image-ids imageTag=${{ github.sha }} \
+              --query 'imageDetails' --output json 2>/dev/null | jq 'length' || echo 0)
+            if [ "$IMAGE_EXISTS" -gt 0 ]; then
+              echo "ECR image already exists. Skipping build."
+              echo "image_exists=true" >> $GITHUB_OUTPUT
+            else
+              echo "ECR image does not exist. Proceeding with build."
+              echo "image_exists=false" >> $GITHUB_OUTPUT
+            fi
+  build-dev:
+    name: Build and Push Docker Image
+    needs: [check-ec2-and-ecr]
+    runs-on: ${{ needs.check-ec2-and-ecr.outputs.workflow_name }}
+    outputs:
+      image_uri: ${{ steps.set-output.outputs.image_uri }}
+    steps:
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v1
+        with:
+          role-to-assume: ${{ secrets.JOSYS_AWS_BUILD_ROLE }}
+          aws-region: ${{ secrets.AWS_DEFAULT_REGION }}
+          role-session-name: GitHub-OIDC-TERRAFORM
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set default image URI
+        id: set-output
+        run: echo "image_uri=${{ secrets.REPOSITORY_URI }}:${{ github.sha }}" >> $GITHUB_OUTPUT
+
+      - name: Skip Build if Image Exists
+        if: needs.check-ec2-and-ecr.outputs.image_exists == 'true'
+        run: |
+          echo "ECR image already exists. Skipping Docker build and push."
+
+      - name: Download compliance file from S3
+        if: needs.check-ec2-and-ecr.outputs.image_exists == 'false'
+        env:
+          S3_COMPLIANCE_BUCKET: ${{ vars.S3_COMPLIANCE_BUCKET }}
+          AWS_DEFAULT_REGION: ${{ secrets.AWS_DEFAULT_REGION }}
+        run: |
+          aws s3 cp s3://${S3_COMPLIANCE_BUCKET}/Josys_OSS_Notice.pdf ./Josys_OSS_Notice.pdf
+          ls -la  # Verify the file exists
+      
+      - name: Build and push DEV image
+        if: needs.check-ec2-and-ecr.outputs.image_exists == 'false'
+        id: build
+        env:
+          AWS_ACCOUNT_ID: ${{ secrets.AWS_ACCOUNT_ID }}
+          AWS_DEFAULT_REGION: ${{ secrets.AWS_DEFAULT_REGION }}
+          DOCKERHUB_LOGIN_PASSWORD: ${{ secrets.DOCKERHUB_LOGIN_PASSWORD }}
+          NPM_AUTH_TOKEN: ${{ secrets.NPM_AUTH_TOKEN }}
+          REPOSITORY_URI: ${{ secrets.REPOSITORY_URI }}
+          RUNTIME_CONFIG: ${{ secrets.RUNTIME_CONFIG }}
+          DOCKER_REPO_BASE: ${{ vars.DOCKER_REPO_BASE }}
+        run: |
+          docker login -u taksel -p $DOCKERHUB_LOGIN_PASSWORD
+          aws ecr get-login-password --region $AWS_DEFAULT_REGION | docker login --username AWS --password-stdin $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com
+          docker pull $REPOSITORY_URI:${RUNTIME_CONFIG}_node || true
+          docker pull $REPOSITORY_URI:${RUNTIME_CONFIG} || true
+          docker build -t node --target node-docker --cache-from $REPOSITORY_URI:${RUNTIME_CONFIG}_node --build-arg RUNTIME_CONFIG=${RUNTIME_CONFIG} --build-arg NPM_AUTH_TOKEN=${NPM_AUTH_TOKEN} --build-arg DOCKER_REPO_BASE=${DOCKER_REPO_BASE} .
+          docker build -t app --cache-from $REPOSITORY_URI:${RUNTIME_CONFIG}_node --cache-from $REPOSITORY_URI:${RUNTIME_CONFIG} --build-arg RUNTIME_CONFIG=${RUNTIME_CONFIG} --build-arg NPM_AUTH_TOKEN=${NPM_AUTH_TOKEN} --build-arg DOCKER_REPO_BASE=${DOCKER_REPO_BASE} .
+          docker tag node $REPOSITORY_URI:${RUNTIME_CONFIG}_node
+          docker tag app $REPOSITORY_URI:${RUNTIME_CONFIG}
+          docker push $REPOSITORY_URI:${RUNTIME_CONFIG}
+          docker push $REPOSITORY_URI:${RUNTIME_CONFIG}_node
+          docker tag app $REPOSITORY_URI:${{ env.WORKFLOW_NAME }}
+          docker push $REPOSITORY_URI:${{ env.WORKFLOW_NAME }}
+          docker tag app $REPOSITORY_URI:dev
+          docker push $REPOSITORY_URI:dev
+          
+  qa-approval:
+    name: "QA Approval"
+    needs: [check-ec2-and-ecr, build-dev]
+    runs-on: ${{ needs.check-ec2-and-ecr.outputs.workflow_name }} 
+    outputs:
+      qa_approved: ${{ steps.qa-approval.outcome == 'success' }}
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v1
+        with:
+          role-to-assume: ${{ secrets.JOSYS_AWS_BUILD_ROLE }}
+          aws-region: ${{ secrets.AWS_DEFAULT_REGION }}
+          role-session-name: GitHub-OIDC-TERRAFORM
+
+      - name: Manual Approval for QA
+        id: qa-approval
+        uses: trstringer/manual-approval@v1
+        timeout-minutes: 15
+        continue-on-error: true
+        with:
+          secret: ${{ secrets.WORKFLOW_PAT_TOKEN }}
+          approvers: ${{ secrets.QA_APPROVERS }}
+          minimum-approvals: ${{ secrets.QA_MINIMUM_APPROVALS }}
+          message: 'Please approve deployment to QA within timeout'
+          issue-title: 'QA Deployment Approval Required'
+          issue-body: |
+            A new deployment to QA requires your approval.
+            
+            Instance ID: ${{ needs.check-ec2-and-ecr.outputs.instance_id }}
+            Public IP: ${{ needs.check-ec2-and-ecr.outputs.public_ip }}
+            Build SHA: ${{ github.sha }}
+            Triggered by: ${{ github.actor }}
+            Workflow: ${{ github.workflow }}
+            
+            Please review and respond with one of:
+            - "approved" or "lgtm" to approve
+            - "denied" or "no" to reject
+  promote-to-qa:
+    name: Tag as QA
+    needs: [check-ec2-and-ecr,build-dev,qa-approval]
+    runs-on: ${{ needs.check-ec2-and-ecr.outputs.workflow_name }}
+    steps:
+
+        - name: Configure AWS credentials
+          if: needs.qa-approval.outputs.qa_approved == 'true'
+          uses: aws-actions/configure-aws-credentials@v1
+          with:
+            role-to-assume: ${{ secrets.JOSYS_AWS_BUILD_ROLE }}
+            aws-region: ${{ secrets.AWS_DEFAULT_REGION }}
+            role-session-name: GitHub-OIDC-TERRAFORM
+            
+        - name: Tag QA in ECR
+          if: needs.qa-approval.outputs.qa_approved == 'true'
+          run: |
+            aws ecr put-image \
+            --repository-name ${{ vars.ECR_REPO_NAME }} \
+            --image-tag qa \
+            --image-manifest "$(aws ecr batch-get-image --repository-name ${{ vars.ECR_REPO_NAME }} --image-ids imageTag=${{ github.sha }} --query 'images[].imageManifest' --output text)"
+  step-summary:
+    name: "Step Summary"
+    needs: [check-ec2-and-ecr, build-dev, qa-approval, promote-to-qa]
+    runs-on: ${{ needs.check-ec2-and-ecr.outputs.workflow_name }}
+    steps:
+    
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v1
+        with:
+          role-to-assume: ${{ secrets.JOSYS_AWS_BUILD_ROLE }}
+          aws-region: ${{ secrets.AWS_DEFAULT_REGION }}
+          role-session-name: GitHub-OIDC-TERRAFORM
+
+      - name: Fetch Image Digest for Commit SHA
+        id: fetch-digest-commit
+        run: |
+          IMAGE_DIGEST=$(aws ecr describe-images \
+            --repository-name ${{ vars.ECR_REPO_NAME }} \
+            --image-ids imageTag=${{ github.sha }} \
+            --query 'imageDetails[0].imageDigest' --output text)
+          echo "image_digest_commit=$IMAGE_DIGEST" >> $GITHUB_ENV
+          echo "Commit SHA Image Digest: $IMAGE_DIGEST"
+          
+      - name: Fetch Image Digest for Dev Tag
+        id: fetch-digest-dev
+        run: |
+          DEV_IMAGE_DIGEST=$(aws ecr describe-images \
+            --repository-name ${{ vars.ECR_REPO_NAME }} \
+            --image-ids imageTag=dev \
+            --query 'imageDetails[0].imageDigest' --output text)
+          echo "image_digest_dev=$DEV_IMAGE_DIGEST" >> $GITHUB_ENV
+          echo "Dev Tag Image Digest: $DEV_IMAGE_DIGEST"
+      - name: Fetch Image Digest for QA Tag
+        id: fetch-digest-qa
+        if: needs.qa-approval.outputs.qa_approved == 'true'
+        run: |
+          QA_IMAGE_DIGEST=$(aws ecr describe-images \
+            --repository-name ${{ vars.ECR_REPO_NAME }} \
+            --image-ids imageTag=qa \
+            --query 'imageDetails[0].imageDigest' --output text)
+          echo "image_digest_qa=$QA_IMAGE_DIGEST" >> $GITHUB_ENV
+          echo "QA Tag Image Digest: $QA_IMAGE_DIGEST"
+          
+      - name: Generate Step Summary (QA Approved)
+        if: needs.qa-approval.outputs.qa_approved == 'true'
+        run: |
+          echo "# 🚀 Deployment Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "---" >> $GITHUB_STEP_SUMMARY
+          echo "## ✅ QA Approved Deployment" >> $GITHUB_STEP_SUMMARY
+          echo "🔹 **Commit ID:** \`${{ github.sha }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "🌿 **Branch:** \`${{ github.ref }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "📄 **Workflow Name:** \`${{ github.workflow }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "🏁 **Image Successfully Tagged as QA**" >> $GITHUB_STEP_SUMMARY
+          echo "🔑 **Commit SHA Image Digest:** \`${{ env.image_digest_commit }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "🔑 **Dev Tag Image Digest:** \`${{ env.image_digest_dev }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "🔑 **QA Tag Image Digest:** \`${{ env.image_digest_qa }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "✅ **Deployment completed successfully!**" >> $GITHUB_STEP_SUMMARY
+          
+      - name: Generate Step Summary (QA Not Approved)
+        if: needs.qa-approval.outputs.qa_approved != 'true'
+        run: |
+          echo "# 🚀 Deployment Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "---" >> $GITHUB_STEP_SUMMARY
+          echo "## ❌ QA Approval Not Received" >> $GITHUB_STEP_SUMMARY
+          echo "⚠️ **QA Deployment was NOT approved within the timeout.**" >> $GITHUB_STEP_SUMMARY
+          echo "🔹 **Commit ID:** \`${{ github.sha }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "🌿 **Branch:** \`${{ github.ref }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "📄 **Workflow Name:** \`${{ github.workflow }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "❌ **Skipping QA Tagging.**" >> $GITHUB_STEP_SUMMARY
+          echo "⚠️ **Review the logs and re-trigger the workflow if necessary.**" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "---" >> $GITHUB_STEP_SUMMARY
+          echo "## 📦 ECR Image Details" >> $GITHUB_STEP_SUMMARY
+          echo "🏢 **ECR Repository:** \`${{ vars.ECR_REPO_NAME }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "🆔 **AWS Account ID:** \`${{ secrets.AWS_ACCOUNT_ID }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "🌍 **AWS Region:** \`${{ secrets.AWS_DEFAULT_REGION }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "🖼️ **Image Tags Available:**" >> $GITHUB_STEP_SUMMARY
+          echo "   - 🔹 **Commit SHA:** \`${{ github.sha }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "   - 🚀 **Dev Tag:** \`dev\`" >> $GITHUB_STEP_SUMMARY
+          echo "🔑 **Commit SHA Image Digest:** \`${{ env.image_digest_commit }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "🔑 **Dev Tag Image Digest:** \`${{ env.image_digest_dev }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "✅ **Dev Image Successfully Pushed!**" >> $GITHUB_STEP_SUMMARY
+                
+  remove-runner-and-terminate:
+    name: "Remove Runner & Terminate EC2"
+    needs: [check-ec2-and-ecr,build-dev,qa-approval,promote-to-qa,step-summary]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v1
+        with:
+          role-to-assume: ${{ secrets.JOSYS_AWS_BUILD_ROLE }}
+          aws-region: ${{ secrets.AWS_DEFAULT_REGION }}
+          role-session-name: GitHub-OIDC-TERRAFORM
+
+      - name: Fetch EC2 Public IP
+        id: fetch-public-ip
+        run: |
+          PUBLIC_IP=$(aws ec2 describe-instances \
+            --filters "Name=tag:Name,Values=dev-{service-abbreviation}-${{ github.sha }}" "Name=instance-state-name,Values=running" \
+            --query 'Reservations[0].Instances[0].PublicIpAddress' --output text)
+          echo "public_ip=$PUBLIC_IP" >> $GITHUB_ENV
+          echo "public_ip:$PUBLIC_IP"
+          echo "public_ip=$PUBLIC_IP" >> $GITHUB_ENV
+      - name: Create working directory
+        run: mkdir -p ~/runner_setup && cd ~/runner_setup
+          
+      - name: Run Removal Script on EC2
+        run: |
+          echo "${{ secrets.SELF_HOSTED_RUNNER_SSH_KEY }}" > ~/runner_setup/${{ secrets.SELF_HOSTED_RUNNER_EC2_KEY_NAME }}
+          chmod 600 ~/runner_setup/${{ secrets.SELF_HOSTED_RUNNER_EC2_KEY_NAME }}
+          mkdir -p ~/.ssh
+          echo "StrictHostKeyChecking no" > ~/.ssh/config
+          ssh -i ~/runner_setup/${{ secrets.SELF_HOSTED_RUNNER_EC2_KEY_NAME }} ubuntu@${{ env.public_ip }} << 'EOF'
+            # Update package list
+            cd actions-runner/
+            ./removal.sh "${{ env.WORKFLOW_NAME }}" "${{ secrets.WORKFLOW_PAT_TOKEN }}" "${{ secrets.TARGET_REPO_NAME }}"
+            # Wait for service to start
+            sleep 10
+          EOF
+      - name: Terminate EC2 Instance
+        run: |
+          aws ec2 terminate-instances --instance-ids ${{ needs.check-ec2-and-ecr.outputs.instance_id }}
+          aws ec2 wait instance-terminated --instance-ids ${{ needs.check-ec2-and-ecr.outputs.instance_id }}
+          echo "EC2 Instance Terminated"

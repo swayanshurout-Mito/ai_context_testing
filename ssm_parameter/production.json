@@ -1,0 +1,13 @@
+[
+  {
+    "name": "",
+    "datadog": "true",
+    "ssm_path": "/josys/production/",
+    "ecs_cluster_name": "",
+    "ecs_service_name": "",
+    "task_definition_name": "",
+    "kms_key_id": "ea2c2e11-686a-47f5-8191-c50c1e5a4cd9",
+    "parameters": [],
+    "secure_parameters": []
+  }
+]
