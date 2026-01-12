@@ -1,0 +1,29 @@
+name: Centralized CI Pipeline
+
+on:
+  push:
+  pull_request:
+    types: [ opened, synchronize, reopened ]
+  release:
+    types: [ published ]
+  create:
+  issue_comment:
+    types: [ created, edited ]
+
+# Grant the minimal permissions your scanners need
+permissions:
+  contents: read
+  id-token: write
+  security-events: write
+  actions: read
+  checks: read
+  pull-requests: read
+  issues: read
+
+jobs:
+  centralized-ci:
+    name: Centralized CI
+    uses: josys-src/security_template/.github/workflows/global-template.yml@main
+    with:
+      environment: main
+    secrets: inherit
