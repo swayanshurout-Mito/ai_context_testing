@@ -1,4 +1,5 @@
-FROM node:20
+ARG DOCKER_REPO_BASE=docker.io
+FROM ${DOCKER_REPO_BASE}/node:20-bookworm-slim
 
 WORKDIR  /app
 

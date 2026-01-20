@@ -9,8 +9,8 @@ phases:
       - aws s3 cp s3://${S3_COMPLIANCE_BUCKET}/Josys_OSS_Notice.pdf ./Josys_OSS_Notice.pdf
       - docker pull $REPOSITORY_URI:${RUNTIME_CONFIG}_node || true
       - docker pull $REPOSITORY_URI:${RUNTIME_CONFIG} || true
-      - docker build -t node --target node-docker --cache-from $REPOSITORY_URI:${RUNTIME_CONFIG}_node --build-arg RUNTIME_CONFIG=${RUNTIME_CONFIG} .
-      - docker build -t app --cache-from $REPOSITORY_URI:${RUNTIME_CONFIG}_node --cache-from $REPOSITORY_URI:${RUNTIME_CONFIG} --build-arg RUNTIME_CONFIG=${RUNTIME_CONFIG} .
+      - docker build -t node --target node-docker --cache-from $REPOSITORY_URI:${RUNTIME_CONFIG}_node --build-arg RUNTIME_CONFIG=${RUNTIME_CONFIG} . --build-arg DOCKER_REPO_BASE=$DOCKER_REPO_BASE
+      - docker build -t app --cache-from $REPOSITORY_URI:${RUNTIME_CONFIG}_node --cache-from $REPOSITORY_URI:${RUNTIME_CONFIG} --build-arg RUNTIME_CONFIG=${RUNTIME_CONFIG} . --build-arg DOCKER_REPO_BASE=$DOCKER_REPO_BASE
       - docker tag node $REPOSITORY_URI:${RUNTIME_CONFIG}_node
       - docker tag app $REPOSITORY_URI:${RUNTIME_CONFIG}
   post_build:
@@ -20,4 +20,4 @@ phases:
       - printf '[{"name":"app","imageUri":"%s"}]' $REPOSITORY_URI:$RUNTIME_CONFIG > imagedefinitions.json
 artifacts:
     files:
-      - imagedefinitions.json
+    - imagedefinitions.json
