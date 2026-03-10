@@ -1,0 +1,107 @@
+name: AI Security Review
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+  push:
+    branches: [main, master, develop, staging, production]
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+
+concurrency:
+  group: ai-sec-fix-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: true
+
+jobs:
+  security-scan:
+    name: Semgrep Scan + AI Fix Suggestions
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Semgrep
+        run: pip install semgrep
+
+      - name: Install AI review dependencies
+        run: pip install openai
+
+      - name: Run Semgrep scan
+        id: scan
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            echo "mode=pr" >> $GITHUB_OUTPUT
+            semgrep scan --config auto --json \
+              --baseline-commit ${{ github.event.pull_request.base.sha }} \
+              --timeout 300 \
+              > semgrep_results.json 2>semgrep_stderr.txt || true
+          else
+            echo "mode=push" >> $GITHUB_OUTPUT
+            semgrep scan --config auto --json \
+              --timeout 300 \
+              > semgrep_results.json 2>semgrep_stderr.txt || true
+          fi
+
+          COUNT=$(python3 -c "import json; d=json.load(open('semgrep_results.json')); print(len(d.get('results',[])))")
+          echo "findings_count=$COUNT" >> $GITHUB_OUTPUT
+          echo "::notice::Semgrep found $COUNT finding(s)"
+
+      - name: AI Security Review
+        if: steps.scan.outputs.findings_count != '0'
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SCAN_MODE: ${{ steps.scan.outputs.mode }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: python3 .github/scripts/ai_sec_review.py semgrep_results.json
+
+      - name: Post clean summary
+        if: steps.scan.outputs.findings_count == '0'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const event = context.eventName;
+            if (event === 'pull_request') {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.payload.pull_request.number,
+                body: '## 🛡️ AI Security Review\n\n✅ **No vulnerabilities found.** Clean scan!'
+              });
+            }
+
+      - name: Upload scan results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: semgrep-results
+          path: |
+            semgrep_results.json
+            semgrep_stderr.txt
+          retention-days: 30
+
+      - name: Fail on high severity
+        if: steps.scan.outputs.findings_count != '0'
+        run: |
+          HIGH=$(python3 -c "
+          import json
+          d=json.load(open('semgrep_results.json'))
+          high=sum(1 for r in d.get('results',[]) if r.get('extra',{}).get('severity','').upper()=='ERROR')
+          print(high)
+          ")
+          if [ "$HIGH" -gt 0 ]; then
+            echo "::error::$HIGH high-severity vulnerability(ies) found"
+            exit 1
+          fi

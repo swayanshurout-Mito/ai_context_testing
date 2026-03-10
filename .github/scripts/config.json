@@ -1,0 +1,17 @@
+{
+  "max_findings": 25,
+  "openai_model": "gpt-4o-mini",
+  "openai_max_tokens": 2048,
+  "openai_temperature": 0.1,
+  "semgrep_config": "auto",
+  "semgrep_timeout": 300,
+  "fail_on_severity": ["ERROR"],
+  "skip_paths": [
+    "node_modules/",
+    "vendor/",
+    ".terraform/",
+    "dist/",
+    "build/"
+  ],
+  "rulesets": ["auto"]
+}
