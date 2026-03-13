@@ -68,6 +68,44 @@ def _extract_imports(lines: list[str], file_path: str) -> str:
     return "\n".join(imports) if imports else "(no imports found)"
 
 
+def _resolve_local_imports(lines: list[str], file_path: str, repo_root: str) -> str:
+    """Read full source of same-repo imported modules.
+
+    For example if the file has:
+        from controllers.auth_config import INTERNAL_REPORT_COMMANDS
+    we read controllers/auth_config.py and include its content.
+    """
+    imported_files: dict[str, str] = {}
+
+    for line in lines[:60]:
+        stripped = line.strip()
+        m = re.match(r"^from\s+([\w.]+)\s+import\s+", stripped)
+        if not m:
+            continue
+
+        module = m.group(1)
+        rel_path = module.replace(".", "/") + ".py"
+        abs_path = os.path.join(repo_root, rel_path)
+
+        if os.path.isfile(abs_path) and rel_path not in imported_files:
+            try:
+                with open(abs_path, encoding="utf-8", errors="replace") as f:
+                    content = f.read()
+                if len(content) > 4000:
+                    content = content[:4000] + "\n... (truncated)"
+                imported_files[rel_path] = content
+            except (FileNotFoundError, PermissionError):
+                pass
+
+    if not imported_files:
+        return "(no local imports resolved)"
+
+    parts = []
+    for path, content in imported_files.items():
+        parts.append(f"--- {path} ---\n{content}")
+    return "\n\n".join(parts)
+
+
 def _format_call_graph(cg: CallGraphResult) -> str:
     """Format call graph into readable text."""
     parts = []
@@ -123,6 +161,7 @@ def build_deep_context(
     lines = _read_file_lines(file_path, repo_root)
     vuln_code = _extract_vulnerable_block(lines, start_line, end_line, padding=10)
     imports = _extract_imports(lines, file_path)
+    local_imports = _resolve_local_imports(lines, file_path, repo_root)
 
     cg = build_call_graph(file_path, start_line, repo_root)
     cg_summary = _format_call_graph(cg)
@@ -141,6 +180,7 @@ def build_deep_context(
     prompt = (
         f"FILE: {file_path}\n\n"
         f"IMPORTS:\n{imports}\n\n"
+        f"IMPORTED FILE CONTENTS (from same repo):\n{local_imports}\n\n"
         f"VULNERABLE CODE (with surrounding context):\n{vuln_code}\n\n"
         f"CALL GRAPH:\n{cg_summary}\n\n"
         f"RELATED CODE FROM CODEBASE:\n{related_code}\n"

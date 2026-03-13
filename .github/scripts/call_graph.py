@@ -131,6 +131,8 @@ def _py_extract_callees(source: str, func_name: str) -> list[str]:
                 callees.append(node.func.id)
             elif isinstance(node.func, ast.Attribute):
                 callees.append(node.func.attr)
+        elif isinstance(node, ast.Name):
+            callees.append(node.id)
 
     return list(dict.fromkeys(callees))
 
@@ -230,30 +232,36 @@ def find_callers(func_name: str, repo_root: str, source_file: str) -> list[Calle
 
 
 def find_definitions(names: list[str], repo_root: str, exclude_file: str) -> list[str]:
-    """Find definitions of given function/class names across the repo."""
+    """Find definitions of given function/class/variable names across the repo."""
     definitions = []
 
     for name in names[:15]:
-        try:
-            result = subprocess.run(
-                ["grep", "-rn", "--include=*.py", "--include=*.js", "--include=*.ts",
-                 rf"^\s*(?:def|class|function|const|let|var|func)\s+{name}\b",
-                 repo_root],
-                capture_output=True, text=True, timeout=10,
-            )
-        except (subprocess.TimeoutExpired, FileNotFoundError):
-            continue
-
-        for line in result.stdout.splitlines()[:3]:
-            parts = line.split(":", 2)
-            if len(parts) < 3:
+        for pattern in [
+            rf"^\s*(?:def|class|function|const|let|var|func)\s+{name}\b",
+            rf"^{name}\s*=",
+            rf"^\s+{name}\s*=",
+        ]:
+            try:
+                result = subprocess.run(
+                    ["grep", "-rn", "--include=*.py", "--include=*.js", "--include=*.ts",
+                     pattern, repo_root],
+                    capture_output=True, text=True, timeout=10,
+                )
+            except (subprocess.TimeoutExpired, FileNotFoundError):
                 continue
-            file_path = os.path.relpath(parts[0], repo_root)
-            if file_path == exclude_file:
-                continue
-            definitions.append(f"{file_path}:{parts[1]}: {parts[2].strip()[:150]}")
 
-    return definitions[:20]
+            for line in result.stdout.splitlines()[:3]:
+                parts = line.split(":", 2)
+                if len(parts) < 3:
+                    continue
+                file_path = os.path.relpath(parts[0], repo_root)
+                if file_path == exclude_file:
+                    continue
+                entry = f"{file_path}:{parts[1]}: {parts[2].strip()[:150]}"
+                if entry not in definitions:
+                    definitions.append(entry)
+
+    return definitions[:30]
 
 
 def build_call_graph(
