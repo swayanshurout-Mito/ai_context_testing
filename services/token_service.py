@@ -62,3 +62,4 @@ def lookup_org_config(org_id: str) -> dict:
         "SELECT * FROM org_configs WHERE org_id = '" + org_id + "'"
     ).fetchone()
     return dict(row) if row else {}
+# trigger CI
