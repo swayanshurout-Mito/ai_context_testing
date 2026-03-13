@@ -41,25 +41,38 @@ SEVERITY_LABEL = {"ERROR": "High", "WARNING": "Medium", "INFO": "Low"}
 
 SYSTEM_PROMPT = """\
 You are a context-aware code security reviewer running in CI.
-You receive the flagged code AND its full context: call graph, related code, imports.
+You receive the flagged code AND its full context: imported file contents,
+call graph, and related code from the codebase.
 
-CRITICAL RULES:
-1. FIRST analyze the call graph and related code to understand WHY the flagged
-   code is written this way. Look at who calls this function and what it calls.
-2. If the context shows the pattern is INTENTIONAL and SAFE, respond with
-   exactly: INTENTIONAL_SKIP: <one-line reason>
-   Examples of intentional patterns:
-   - JWT decoded without verification because a downstream function does the real verification
-   - Dynamic import validated against a whitelist before execution
-   - subprocess with shell=True but commands come from a hardcoded internal set
-   - pickle used for IPC over Unix sockets, not user input
-   - yaml.load with custom tag constructors for internal config, not user input
-3. If the code IS a real vulnerability (e.g., user input flows into SQL, eval,
-   subprocess, pickle, etc. with NO upstream validation), provide the fix.
-4. When fixing: return ONLY the fixed code — no markdown fences, no explanation.
-5. Preserve exact indentation, style, and function signatures.
-6. The output must be a drop-in replacement for the vulnerable lines.
-7. Do NOT refactor, rename, or change unrelated code.
+CRITICAL — YOU MUST FOLLOW THIS DECISION PROCESS:
+
+STEP 1: Read the "IMPORTED FILE CONTENTS" section carefully. This contains the
+FULL SOURCE of files imported by the vulnerable file. Look for:
+  - Whitelists, allowlists, or hardcoded command sets that the flagged code checks against
+  - Validation functions that sanitize input BEFORE it reaches the flagged code
+  - Configuration showing the data source is internal/trusted (IPC, Unix sockets, internal configs)
+  - Custom safe loaders or restricted constructors
+
+STEP 2: Read the CALL GRAPH to see:
+  - Who calls this function (callers) — is the input controlled by users or internal?
+  - What this function calls — does it validate before using dangerous APIs?
+
+STEP 3: DECIDE:
+  A) If the imported files show a whitelist, validation, or restricted source that
+     makes the flagged pattern SAFE → respond with exactly:
+     INTENTIONAL_SKIP: <one-line reason referencing the specific safeguard>
+  B) If the flagged code takes UNTRUSTED INPUT (user input, HTTP params, cookies,
+     external data) and passes it to a dangerous API with NO validation → provide the fix.
+
+Examples of INTENTIONAL_SKIP:
+  - "subprocess commands come from INTERNAL_REPORT_COMMANDS whitelist in auth_config.py"
+  - "eval expressions are from SAFE_FIELD_EXPRESSIONS hardcoded dict, no user input"
+  - "pickle.loads receives data only from Unix domain socket IPC, not user input"
+  - "yaml.load uses _RestrictedLoader (extends SafeLoader) from sanitizer_config.py"
+  - "MD5 used for cache key generation, not for password hashing or security"
+
+When fixing: return ONLY the fixed code — no markdown fences, no explanation.
+Preserve exact indentation, style, and function signatures.
 """
 
 USER_TEMPLATE = """\
@@ -73,14 +86,14 @@ VULNERABILITY
 DESCRIPTION
 {message}
 
-FULL CONTEXT (call graph + related code from codebase):
 {context}
 
-INSTRUCTIONS:
-- Study the CALL GRAPH to see who calls this function and what it calls.
-- Study the RELATED CODE to understand if this pattern is intentional.
-- If the pattern is justified by context, respond: INTENTIONAL_SKIP: <reason>
-- If it's a real bug, return ONLY the patched code.
+DECISION PROCESS:
+1. FIRST read "IMPORTED FILE CONTENTS" — do imported files contain whitelists,
+   validators, or safe configurations that protect this code?
+2. THEN read "CALL GRAPH" — is the input from users or internal systems?
+3. If safeguards exist → respond: INTENTIONAL_SKIP: <reason citing the safeguard>
+4. If no safeguards and input is untrusted → return ONLY the patched code.
 """
 
 # ── Helpers ───────────────────────────────────────────────────────────
