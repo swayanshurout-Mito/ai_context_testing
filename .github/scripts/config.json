@@ -1,17 +1,22 @@
 {
-  "max_findings": 25,
+  "max_findings": 30,
   "openai_model": "gpt-4o-mini",
-  "openai_max_tokens": 2048,
+  "openai_max_tokens": 3000,
   "openai_temperature": 0.1,
+  "embedding_model": "text-embedding-3-small",
   "semgrep_config": "auto",
   "semgrep_timeout": 300,
   "fail_on_severity": ["ERROR"],
+  "max_chunks": 500,
+  "max_files_to_embed": 200,
+  "chunk_size_lines": 60,
+  "top_k_similar": 5,
   "skip_paths": [
     "node_modules/",
     "vendor/",
     ".terraform/",
     "dist/",
-    "build/"
-  ],
-  "rulesets": ["auto"]
+    "build/",
+    "__pycache__/"
+  ]
 }
